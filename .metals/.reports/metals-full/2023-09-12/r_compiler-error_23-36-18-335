@@ -1,0 +1,169 @@
+java.lang.AssertionError: NoDenotation.owner
+occurred in the presentation compiler.
+
+action parameters:
+uri: file://<WORKSPACE>/live-server.scala
+text:
+//> using toolkit typelevel:latest
+
+import cats.effect.kernel.Async
+import fs2.io.file.Files
+import org.http4s.server.websocket.WebSocketBuilder2
+import cats.effect.std.Queue
+import org.http4s.dsl.Http4sDsl
+import org.http4s.HttpRoutes
+import org.http4s.websocket.WebSocketFrame
+import org.http4s.StaticFile
+import cats.effect.kernel.Resource
+import com.comcast.ip4s.Host
+import com.comcast.ip4s.Port
+import org.http4s.ember.server.EmberServerBuilder
+import fs2.io.file.Path
+
+object LiveServer {
+
+  final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
+      implicit F: Async[F]
+  ) extends Http4sDsl[F] {
+
+    val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root =>
+      val send: fs2.Stream[F, WebSocketFrame] =
+        fs2.Stream
+          .fromQueueUnterminated(sq)
+          .map(message => WebSocketFrame.Text(message))
+      val receive: fs2.Pipe[F, WebSocketFrame, Unit] =
+        is => is.evalMap { _ => F.unit }
+
+      ws.build(send, receive)
+    }
+  }
+
+  final class StaticFileServer[F[_]: Files](entryFile: Option[String]) {
+    private val indexHtml: HttpRoutes[F] =
+      for {
+        injected <- Files[F]
+          .readAll(Path("injected.html"))
+          .through(fs2.text.utf8Decode)
+          .compile
+          .lastOrError
+
+        index0 <- StaticFile
+          .fromPath(Path(entryFile.getOrElse(".")))
+          .getOrElseF(NotFound())
+
+        index <- F.fromOption(
+          for {
+            htmlBody0 <- index0.split("<html>").lastOption
+            htmlBody <- htmlBody0.split("</html>").lastOption
+          } yield s"<html>$htmlBody$injected</html>",
+          new RuntimeException("Failed to serve index.html")
+        )
+
+        route <- index0.flatMap { b => b.body.replace(index) }
+      } yield route
+
+    val routes = indexHtml
+  }
+
+  def runF[F[_]: Async: Files]: F[Unit] =
+    for {
+      host <- Resource.eval {
+        Async[F].fromOption(
+          Host.fromString("localhost"),
+          new IllegalArgumentException("Invalid host")
+        )
+      }
+
+      port <- Resource.eval {
+        Async[F].fromOption(
+          Port.fromInt(8090),
+          new IllegalArgumentException("Invalid port")
+        )
+      }
+
+      wsOut <- cats.effect.std.Queue.unbounded[F, String]
+
+      _ <- Files[F]
+        .watch(fs2.io.file.Path("."))
+        .evalMap { _ => wsOut.offer("reload") }
+        .compile
+        .drain
+
+      allRoutes = (wsb: WebSocketBuilder2) => {
+        val ws = new Websocket[F](wsb, wsOut).routes
+        val static = new StaticFileServer[F]().routes
+        ws <+> static
+      }
+
+      server <- EmberServerBuilder
+        .default[F]
+        .withHost(host)
+        .withPort(port)
+        .withHttpWebSocketApp(wsb => allRoutes(wsb))
+
+    } yield server
+}
+
+
+
+error stacktrace:
+dotty.tools.dotc.core.SymDenotations$NoDenotation$.owner(SymDenotations.scala:2576)
+	dotty.tools.dotc.core.SymDenotations$SymDenotation.isSelfSym(SymDenotations.scala:711)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:157)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.fold$1(Trees.scala:1532)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.apply(Trees.scala:1534)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1565)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:278)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1573)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:278)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.fold$1(Trees.scala:1532)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.apply(Trees.scala:1534)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1571)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:278)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse$$anonfun$13(ExtractSemanticDB.scala:218)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.immutable.List.foreach(List.scala:333)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:218)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1616)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:181)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse$$anonfun$11(ExtractSemanticDB.scala:204)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.immutable.List.foreach(List.scala:333)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:204)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1624)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:178)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse$$anonfun$11(ExtractSemanticDB.scala:204)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.immutable.List.foreach(List.scala:333)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:204)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.apply(Trees.scala:1660)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1624)
+	dotty.tools.dotc.ast.Trees$Instance$TreeAccumulator.foldOver(Trees.scala:1538)
+	dotty.tools.dotc.ast.Trees$Instance$TreeTraverser.traverseChildren(Trees.scala:1661)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:178)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse$$anonfun$1(ExtractSemanticDB.scala:142)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.immutable.List.foreach(List.scala:333)
+	dotty.tools.dotc.semanticdb.ExtractSemanticDB$Extractor.traverse(ExtractSemanticDB.scala:142)
+	scala.meta.internal.pc.SemanticdbTextDocumentProvider.textDocument(SemanticdbTextDocumentProvider.scala:38)
+	scala.meta.internal.pc.ScalaPresentationCompiler.semanticdbTextDocument$$anonfun$1(ScalaPresentationCompiler.scala:174)

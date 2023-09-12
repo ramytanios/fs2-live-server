@@ -1,0 +1,336 @@
+java.lang.AssertionError: assertion failed: `wildApprox` failed to remove uninstantiated F
+occurred in the presentation compiler.
+
+action parameters:
+offset: 1152
+uri: file://<WORKSPACE>/live-server.scala
+text:
+//> using toolkit typelevel:latest
+//> using dep org.http4s::http4s-ember-server:1.0.0-M40
+//> using dep org.http4s::http4s-dsl:1.0.0-M40
+
+import cats.effect.kernel.Async
+import fs2.io.file.Files
+import org.http4s.server.websocket.WebSocketBuilder2
+import cats.effect.std.Queue
+import org.http4s.dsl.Http4sDsl
+import org.http4s.HttpRoutes
+import org.http4s.websocket.WebSocketFrame
+import org.http4s.StaticFile
+import cats.effect.kernel.Resource
+import com.comcast.ip4s.Host
+import com.comcast.ip4s.Port
+import org.http4s.ember.server.EmberServerBuilder
+import fs2.io.file.Path
+
+object LiveServer {
+
+  final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
+      implicit F: Async[F]
+  ) extends Http4sDsl[F] {
+
+    val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root =>
+      val send: fs2.Stream[F, WebSocketFrame] =
+        fs2.Stream
+          .fromQueueUnterminated(sq)
+          .map(message => WebSocketFrame.Text(message))
+      val receive: fs2.Pipe[F, WebSocketFrame, Unit] =
+        is => is.evalMap { _ => F.unit }
+
+      ws.build(send, receive)
+    }
+  }
+
+  final class StaticFileServer[F[_]: Files: Concu@@](entryFile: Option[String]) {
+    private val indexHtml: HttpRoutes[F] =
+      for {
+        injected <- Files[F]
+          .readAll(Path("injected.html"))
+          .through(fs2.text.utf8Decode)
+          .compile
+          .lastOrError
+
+        index0 <- StaticFile
+          .fromPath(Path(entryFile.getOrElse(".")))
+          .getOrElseF(NotFound())
+
+        index <- F.fromOption(
+          for {
+            htmlBody0 <- index0.split("<html>").lastOption
+            htmlBody <- htmlBody0.split("</html>").lastOption
+          } yield s"<html>$htmlBody$injected</html>",
+          new RuntimeException("Failed to serve index.html")
+        )
+
+        route <- index0.flatMap { b => b.body.replace(index) }
+      } yield route
+
+    val routes = indexHtml
+  }
+
+  def runF[F[_]: Async: Files]: F[Unit] =
+    for {
+      host <- Resource.eval {
+        Async[F].fromOption(
+          Host.fromString("localhost"),
+          new IllegalArgumentException("Invalid host")
+        )
+      }
+
+      port <- Resource.eval {
+        Async[F].fromOption(
+          Port.fromInt(8090),
+          new IllegalArgumentException("Invalid port")
+        )
+      }
+
+      wsOut <- cats.effect.std.Queue.unbounded[F, String]
+
+      _ <- Files[F]
+        .watch(fs2.io.file.Path("."))
+        .evalMap { _ => wsOut.offer("reload") }
+        .compile
+        .drain
+
+      allRoutes = (wsb: WebSocketBuilder2) => {
+        val ws = new Websocket[F](wsb, wsOut).routes
+        val static = new StaticFileServer[F]().routes
+        ws <+> static
+      }
+
+      server <- EmberServerBuilder
+        .default[F]
+        .withHost(host)
+        .withPort(port)
+        .withHttpWebSocketApp(wsb => allRoutes(wsb))
+
+    } yield server
+}
+
+
+
+error stacktrace:
+scala.runtime.Scala3RunTime$.assertFailed(Scala3RunTime.scala:8)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:621)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6158)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeAccumulator.op$proxy24$1(Types.scala:6138)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldArgs$3(Types.scala:6138)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6142)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeAccumulator.op$proxy24$1(Types.scala:6138)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldArgs$3(Types.scala:6138)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6142)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6220)
+	dotty.tools.dotc.typer.ProtoTypes$FunProto.fold(ProtoTypes.scala:550)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6190)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.typer.ProtoTypes$SelectionProto.fold(ProtoTypes.scala:242)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6190)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.typer.ProtoTypes$FunProto.fold(ProtoTypes.scala:550)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6190)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.core.Types$TypeTraverser.apply(Types.scala:6227)
+	dotty.tools.dotc.typer.ProtoTypes$ViewProto.fold(ProtoTypes.scala:607)
+	dotty.tools.dotc.core.Types$TypeAccumulator.foldOver(Types.scala:6190)
+	dotty.tools.dotc.core.Types$TypeTraverser.traverseChildren(Types.scala:6228)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.traverse(Implicits.scala:629)
+	dotty.tools.dotc.typer.ImplicitRunInfo$collectParts$2$.apply(Implicits.scala:634)
+	dotty.tools.dotc.typer.ImplicitRunInfo.recur$1(Implicits.scala:710)
+	dotty.tools.dotc.typer.ImplicitRunInfo.computeIScope(Implicits.scala:721)
+	dotty.tools.dotc.typer.ImplicitRunInfo.$anonfun$1(Implicits.scala:795)
+	dotty.tools.dotc.util.ReadOnlyMap.getOrElse(ReadOnlyMap.scala:23)
+	dotty.tools.dotc.typer.ImplicitRunInfo.implicitScope(Implicits.scala:795)
+	dotty.tools.dotc.typer.ImplicitRunInfo.implicitScope$(Implicits.scala:575)
+	dotty.tools.dotc.Run.implicitScope(Run.scala:36)
+	dotty.tools.dotc.typer.Implicits$ImplicitSearch.implicitScope(Implicits.scala:1534)
+	dotty.tools.dotc.typer.Implicits$ImplicitSearch.searchImplicit(Implicits.scala:1497)
+	dotty.tools.dotc.typer.Implicits$ImplicitSearch.searchImplicit(Implicits.scala:1506)
+	dotty.tools.dotc.typer.Implicits$ImplicitSearch.bestImplicit(Implicits.scala:1531)
+	dotty.tools.dotc.typer.Implicits.inferImplicit(Implicits.scala:1022)
+	dotty.tools.dotc.typer.Implicits.inferImplicit$(Implicits.scala:806)
+	dotty.tools.dotc.typer.Typer.inferImplicit(Typer.scala:115)
+	dotty.tools.dotc.typer.Implicits.inferView(Implicits.scala:844)
+	dotty.tools.dotc.typer.Implicits.inferView$(Implicits.scala:806)
+	dotty.tools.dotc.typer.Typer.inferView(Typer.scala:115)
+	dotty.tools.dotc.typer.Implicits.viewExists(Implicits.scala:819)
+	dotty.tools.dotc.typer.Implicits.viewExists$(Implicits.scala:806)
+	dotty.tools.dotc.typer.Typer.viewExists(Typer.scala:115)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.isCompatible(ProtoTypes.scala:39)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.isCompatible$(ProtoTypes.scala:26)
+	dotty.tools.dotc.typer.Typer.isCompatible(Typer.scala:115)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.testCompat$1(ProtoTypes.scala:56)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.normalizedCompatible(ProtoTypes.scala:70)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.normalizedCompatible$(ProtoTypes.scala:26)
+	dotty.tools.dotc.typer.Typer.normalizedCompatible(Typer.scala:115)
+	dotty.tools.dotc.typer.ProtoTypes$SelectionProto.qualifies$1(ProtoTypes.scala:209)
+	dotty.tools.dotc.typer.ProtoTypes$SelectionProto.liftedTree1$1$$anonfun$1(ProtoTypes.scala:214)
+	dotty.tools.dotc.core.Denotations$SingleDenotation.hasAltWith(Denotations.scala:640)
+	dotty.tools.dotc.core.Denotations$MultiDenotation.hasAltWith(Denotations.scala:1271)
+	dotty.tools.dotc.core.Denotations$MultiDenotation.hasAltWith(Denotations.scala:1271)
+	dotty.tools.dotc.typer.ProtoTypes$SelectionProto.liftedTree1$1(ProtoTypes.scala:214)
+	dotty.tools.dotc.typer.ProtoTypes$SelectionProto.isMatchedBy(ProtoTypes.scala:226)
+	dotty.tools.dotc.core.TypeComparer.isMatchedByProto(TypeComparer.scala:2041)
+	dotty.tools.dotc.core.TypeComparer.firstTry$1(TypeComparer.scala:328)
+	dotty.tools.dotc.core.TypeComparer.recur(TypeComparer.scala:1455)
+	dotty.tools.dotc.core.TypeComparer.isSubType(TypeComparer.scala:208)
+	dotty.tools.dotc.core.TypeComparer.isSubType(TypeComparer.scala:218)
+	dotty.tools.dotc.core.TypeComparer.topLevelSubType(TypeComparer.scala:128)
+	dotty.tools.dotc.core.TypeComparer.necessarySubType(TypeComparer.scala:139)
+	dotty.tools.dotc.core.TypeComparer$.necessarySubType(TypeComparer.scala:2926)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.necessarilyCompatible(ProtoTypes.scala:47)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.necessarilyCompatible$(ProtoTypes.scala:26)
+	dotty.tools.dotc.typer.Typer.necessarilyCompatible(Typer.scala:115)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.constrainResult(ProtoTypes.scala:97)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.constrainResult$(ProtoTypes.scala:26)
+	dotty.tools.dotc.typer.Typer.constrainResult(Typer.scala:115)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.constrainResult(ProtoTypes.scala:117)
+	dotty.tools.dotc.typer.ProtoTypes$Compatibility.constrainResult$(ProtoTypes.scala:26)
+	dotty.tools.dotc.typer.Typer.constrainResult(Typer.scala:115)
+	dotty.tools.dotc.typer.Typer.implicitArgs$1(Typer.scala:3589)
+	dotty.tools.dotc.typer.Typer.addImplicitArgs$1(Typer.scala:3621)
+	dotty.tools.dotc.typer.Typer.adaptNoArgsImplicitMethod$1(Typer.scala:3697)
+	dotty.tools.dotc.typer.Typer.adaptNoArgs$1(Typer.scala:3886)
+	dotty.tools.dotc.typer.Typer.adapt1(Typer.scala:4120)
+	dotty.tools.dotc.typer.Typer.adapt(Typer.scala:3435)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typeSelectOnTerm$1(Typer.scala:686)
+	dotty.tools.dotc.typer.Typer.typedSelect(Typer.scala:724)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2897)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Applications.realApply$1(Applications.scala:934)
+	dotty.tools.dotc.typer.Applications.typedApply(Applications.scala:1094)
+	dotty.tools.dotc.typer.Applications.typedApply$(Applications.scala:352)
+	dotty.tools.dotc.typer.Typer.typedApply(Typer.scala:115)
+	dotty.tools.dotc.typer.Typer.typedUnnamed$1(Typer.scala:2928)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2991)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typeSelectOnTerm$1(Typer.scala:686)
+	dotty.tools.dotc.typer.Typer.typedSelect(Typer.scala:724)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2897)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Applications.realApply$1(Applications.scala:934)
+	dotty.tools.dotc.typer.Applications.typedApply(Applications.scala:1094)
+	dotty.tools.dotc.typer.Applications.typedApply$(Applications.scala:352)
+	dotty.tools.dotc.typer.Typer.typedApply(Typer.scala:115)
+	dotty.tools.dotc.typer.Typer.typedUnnamed$1(Typer.scala:2928)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2991)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typeSelectOnTerm$1(Typer.scala:686)
+	dotty.tools.dotc.typer.Typer.typedSelect(Typer.scala:724)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2897)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typeSelectOnTerm$1(Typer.scala:686)
+	dotty.tools.dotc.typer.Typer.typedSelect(Typer.scala:724)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2897)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typeSelectOnTerm$1(Typer.scala:686)
+	dotty.tools.dotc.typer.Typer.typedSelect(Typer.scala:724)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2897)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Applications.realApply$1(Applications.scala:934)
+	dotty.tools.dotc.typer.Applications.typedApply(Applications.scala:1094)
+	dotty.tools.dotc.typer.Applications.typedApply$(Applications.scala:352)
+	dotty.tools.dotc.typer.Typer.typedApply(Typer.scala:115)
+	dotty.tools.dotc.typer.Typer.typedUnnamed$1(Typer.scala:2928)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2991)
+	dotty.tools.dotc.typer.Typer.typedUnnamed$1(Typer.scala:2975)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2991)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.Typer.typedValDef(Typer.scala:2326)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2901)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.traverse$1(Typer.scala:3084)
+	dotty.tools.dotc.typer.Typer.typedStats(Typer.scala:3130)
+	dotty.tools.dotc.typer.Typer.typedClassDef(Typer.scala:2562)
+	dotty.tools.dotc.typer.Typer.typedTypeOrClassDef$1(Typer.scala:2916)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2920)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.traverse$1(Typer.scala:3084)
+	dotty.tools.dotc.typer.Typer.typedStats(Typer.scala:3130)
+	dotty.tools.dotc.typer.Typer.typedClassDef(Typer.scala:2562)
+	dotty.tools.dotc.typer.Typer.typedTypeOrClassDef$1(Typer.scala:2916)
+	dotty.tools.dotc.typer.Typer.typedNamed$1(Typer.scala:2920)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2990)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.traverse$1(Typer.scala:3084)
+	dotty.tools.dotc.typer.Typer.typedStats(Typer.scala:3130)
+	dotty.tools.dotc.typer.Typer.typedPackageDef(Typer.scala:2692)
+	dotty.tools.dotc.typer.Typer.typedUnnamed$1(Typer.scala:2961)
+	dotty.tools.dotc.typer.Typer.typedUnadapted(Typer.scala:2991)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3058)
+	dotty.tools.dotc.typer.Typer.typed(Typer.scala:3062)
+	dotty.tools.dotc.typer.Typer.typedExpr(Typer.scala:3174)
+	dotty.tools.dotc.typer.TyperPhase.typeCheck$$anonfun$1(TyperPhase.scala:44)
+	dotty.tools.dotc.typer.TyperPhase.typeCheck$$anonfun$adapted$1(TyperPhase.scala:54)
+	scala.Function0.apply$mcV$sp(Function0.scala:42)
+	dotty.tools.dotc.core.Phases$Phase.monitor(Phases.scala:437)
+	dotty.tools.dotc.typer.TyperPhase.typeCheck(TyperPhase.scala:54)
+	dotty.tools.dotc.typer.TyperPhase.runOn$$anonfun$3(TyperPhase.scala:88)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.immutable.List.foreach(List.scala:333)
+	dotty.tools.dotc.typer.TyperPhase.runOn(TyperPhase.scala:88)
+	dotty.tools.dotc.Run.runPhases$1$$anonfun$1(Run.scala:247)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:15)
+	scala.runtime.function.JProcedure1.apply(JProcedure1.java:10)
+	scala.collection.ArrayOps$.foreach$extension(ArrayOps.scala:1321)
+	dotty.tools.dotc.Run.runPhases$1(Run.scala:263)
+	dotty.tools.dotc.Run.compileUnits$$anonfun$1(Run.scala:271)
+	dotty.tools.dotc.Run.compileUnits$$anonfun$adapted$1(Run.scala:280)
+	dotty.tools.dotc.util.Stats$.maybeMonitored(Stats.scala:67)
+	dotty.tools.dotc.Run.compileUnits(Run.scala:280)
+	dotty.tools.dotc.Run.compileSources(Run.scala:195)
+	dotty.tools.dotc.interactive.InteractiveDriver.run(InteractiveDriver.scala:165)
+	scala.meta.internal.pc.MetalsDriver.run(MetalsDriver.scala:45)
+	scala.meta.internal.pc.completions.CompletionProvider.completions(CompletionProvider.scala:46)
+	scala.meta.internal.pc.ScalaPresentationCompiler.complete$$anonfun$1(ScalaPresentationCompiler.scala:119)
