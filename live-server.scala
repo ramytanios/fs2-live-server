@@ -7,6 +7,7 @@ import fs2.io.file.Files
 import org.http4s.server.websocket.WebSocketBuilder2
 import cats.effect.std.Queue
 import org.http4s.websocket.WebSocketFrame
+import org.http4s.server.middleware
 import com.comcast.ip4s.*
 import org.http4s.ember.server.EmberServerBuilder
 import fs2.io.file.Path
@@ -20,13 +21,17 @@ import org.http4s.dsl._
 import org.http4s.dsl.impl.Responses.NotFoundOps
 import cats.effect.std.Console
 import scala.io.AnsiColor
+import scala.concurrent.duration.*
+import cats.effect.implicits.*
+import org.http4s.server.Server
+import fs2.io.file.Watcher.Event
 
 object LiveServer extends cats.effect.IOApp.Simple {
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
   ) extends Http4sDsl[F] {
-    val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root =>
+    val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root / "ws" =>
       val send: fs2.Stream[F, WebSocketFrame] =
         fs2.Stream
           .fromQueueUnterminated(sq)
@@ -39,7 +44,7 @@ object LiveServer extends cats.effect.IOApp.Simple {
 
   final class StaticFileServer[F[_]: Files: LoggerFactory](
       entryFile: Option[String]
-  )(using F: Concurrent[F])
+  )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root =>
@@ -51,7 +56,7 @@ object LiveServer extends cats.effect.IOApp.Simple {
             .lastOrError
 
           indexRsp <- StaticFile
-            .fromPath[F](fs2.io.file.Path(entryFile.getOrElse(".")))
+            .fromPath[F](fs2.io.file.Path(entryFile.getOrElse("index.html")))
             .getOrElseF(NotFound())
 
           indexBody <- indexRsp.body
@@ -61,15 +66,19 @@ object LiveServer extends cats.effect.IOApp.Simple {
 
           index <- F.fromOption(
             for {
-              htmlBody0 <- indexBody.split("<html>").lastOption
-              htmlBody <- htmlBody0.split("</html>").lastOption
-            } yield s"<html>$htmlBody$injected</html>",
+              ix <- indexBody.indexOf("</html>") match {
+                case -1 => None
+                case ix => ix.some
+              }
+            } yield indexBody.patch(ix, injected, 0),
             new RuntimeException("Failed to serve index.html")
           )
 
+          _ <- C.print(index)
+
         } yield indexRsp.copy(entity =
           Entity.stream[F](
-            fs2.Stream.emit(index).through(fs2.text.utf8Encode)
+            fs2.Stream.emit(index).covary[F].through(fs2.text.utf8Encode)
           )
         )
 
@@ -82,49 +91,73 @@ object LiveServer extends cats.effect.IOApp.Simple {
     val routes = static
   }
 
-  def runF[F[_]: Files](using F: Async[F], C: Console[F]): F[Unit] = {
+  def runF[F[_]: Files](using
+      F: Async[F],
+      C: Console[F]
+  ): Resource[F, Server] = {
     implicit val loggerFactory: LoggerFactory[F] = Slf4jFactory.create[F]
     for {
       host <-
         F.fromOption(
           Host.fromString("localhost"),
           new IllegalArgumentException("Invalid host")
-        )
+        ).toResource
 
       port <-
         F.fromOption(
           Port.fromInt(8090),
           new IllegalArgumentException("Invalid port")
-        )
+        ).toResource
 
-      wsOut <- cats.effect.std.Queue.unbounded[F, String]
+      wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
       _ <- Files[F]
         .watch(fs2.io.file.Path("."))
-        .evalMap { _ =>
-          wsOut.offer("reload").flatTap { _ =>
-            C.println(s"${AnsiColor.CYAN}Changes detected${AnsiColor.RESET}")
-          }
+        .debounce(1.second)
+        .map {
+          case Event.Created(p, _)     => p.some
+          case Event.Deleted(p, _)     => p.some
+          case Event.Modified(p, _)    => p.some
+          case Event.Overflow(_)       => None
+          case Event.NonStandard(_, _) => None
+        }
+        .filterNot(pMaybe =>
+          pMaybe.exists(p => !p.startsWith(fs2.io.file.Path(".")))
+        )
+        .evalMap { pMaybe =>
+          wsOut.offer("reload") *>
+            C.println(
+              s"${AnsiColor.CYAN}Changes detected ${pMaybe.map(p => s"@ `$p`").getOrElse("")}${AnsiColor.RESET}"
+            )
+
         }
         .compile
         .drain
+        .background
 
-      allRoutes = (wsb: WebSocketBuilder2[F]) => {
-        val ws = new Websocket[F](wsb, wsOut).routes
-        val static = new StaticFileServer[F](none[String]).routes
-        (ws <+> static).orNotFound
-      }
+      httpRoutes <-
+        middleware.CORS.policy
+          .withAllowOriginAll(
+            new StaticFileServer[F](none[String]).routes
+          )
+          .toResource
 
-      _ <- EmberServerBuilder
+      server <- EmberServerBuilder
         .default[F]
         .withHost(host)
         .withPort(port)
-        .withHttpWebSocketApp(wsb => allRoutes(wsb))
+        .withHttpWebSocketApp(wsb =>
+          (httpRoutes <+> new Websocket[F](wsb, wsOut).routes).orNotFound
+        )
         .build
-        .use { _ => Async[F].never }
+        .evalTap { _ =>
+          C.println(
+            s"${AnsiColor.MAGENTA}live server started @ $host:$port${AnsiColor.RESET}"
+          )
+        }
 
-    } yield ()
+    } yield server
   }
 
-  override def run: IO[Unit] = runF[IO]
+  override def run: IO[Unit] = runF[IO].use { _ => IO.never }
 }
