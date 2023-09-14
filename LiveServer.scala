@@ -29,12 +29,19 @@ import fs2.io.file.Watcher.Event
 import com.monovore.decline._
 import com.monovore.decline.effect._
 import cats.effect.ExitCode
+import fs2.io.net.Network
 
 object LiveServer
     extends CommandIOApp(
       name = "live server",
       header = "Purely functional live server"
     ) {
+
+  case class Cli(
+      host: String,
+      port: Int,
+      entryFile: fs2.io.file.Path
+  )
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
@@ -51,7 +58,7 @@ object LiveServer
   }
 
   final class StaticFileServer[F[_]: Files: LoggerFactory](
-      entryFile: Option[String]
+      entryFile: fs2.io.file.Path
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
@@ -59,16 +66,16 @@ object LiveServer
         for {
           injected <- Files[F]
             .readAll(fs2.io.file.Path("injected.html"))
-            .through(fs2.text.utf8Decode)
+            .through(fs2.text.utf8.decode)
             .compile
             .lastOrError
 
           indexRsp <- StaticFile
-            .fromPath[F](fs2.io.file.Path(entryFile.getOrElse("index.html")))
+            .fromPath[F](entryFile)
             .getOrElseF(NotFound())
 
           indexBody <- indexRsp.body
-            .through(fs2.text.utf8Decode)
+            .through(fs2.text.utf8.decode)
             .compile
             .lastOrError
 
@@ -84,7 +91,7 @@ object LiveServer
 
         } yield indexRsp.copy(entity =
           Entity.stream[F](
-            fs2.Stream.emit(index).covary[F].through(fs2.text.utf8Encode)
+            fs2.Stream.emit(index).covary[F].through(fs2.text.utf8.encode)
           )
         )
 
@@ -97,7 +104,7 @@ object LiveServer
     val routes = static
   }
 
-  def server[F[_]: Files](ef: Option[String])(using
+  def server[F[_]: Files: Network](cli: Cli)(using
       F: Async[F],
       C: Console[F]
   ): Resource[F, Server] = {
@@ -105,45 +112,49 @@ object LiveServer
     for {
       host <-
         F.fromOption(
-          Host.fromString("127.0.0.1"),
+          Host.fromString(cli.host),
           new IllegalArgumentException("Invalid host")
         ).toResource
 
       port <-
         F.fromOption(
-          Port.fromInt(8080),
+          Port.fromInt(cli.port),
           new IllegalArgumentException("Invalid port")
         ).toResource
 
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
-      isDotfile = (p: fs2.io.file.Path) => p.fileName.startsWith(".")
+      doNotWatch = (p: fs2.io.file.Path) =>
+        F.pure(p.names.exists(_.toString.startsWith(".")))
 
-      _ <- Files[F]
-        .watch(fs2.io.file.Path("."))
-        .debounce(1.second)
-        .map {
-          case Event.Created(p, _)     => p.some
-          case Event.Deleted(p, _)     => p.some
-          case Event.Modified(p, _)    => p.some
-          case Event.Overflow(_)       => None
-          case Event.NonStandard(_, p) => p.some
-        }
-        .filterNot(pMaybe => pMaybe.exists(p => isDotfile(p)))
-        .evalMap { pMaybe =>
-          wsOut.offer("reload") *>
-            C.println(
-              s"${AnsiColor.CYAN}Changes detected ${pMaybe.map(p => s"@ `$p`").getOrElse("")}${AnsiColor.RESET}"
-            )
+      _ <- Files[F].currentWorkingDirectory.flatMap { cwd =>
+        Files[F]
+          .watch(cwd)
+          .debounce(1.second)
+          .map {
+            case Event.Created(p, _)     => p.some
+            case Event.Deleted(p, _)     => p.some
+            case Event.Modified(p, _)    => p.some
+            case Event.Overflow(_)       => None
+            case Event.NonStandard(_, p) => p.some
+          }
+          .evalFilterNot(pMaybe => pMaybe.existsM(doNotWatch))
+          .evalMap { pMaybe =>
+            wsOut.offer("reload") *>
+              C.println(
+                s"""->>${AnsiColor.CYAN}Changes detected ${pMaybe
+                    .map(p => s"at `$p`")
+                    .getOrElse("")}${AnsiColor.RESET}"""
+              )
 
-        }
-        .compile
-        .drain
-        .background
+          }
+          .compile
+          .drain
+      }.background
 
       httpRoutes <-
         middleware.CORS.policy
-          .withAllowOriginAll(new StaticFileServer[F](ef).routes)
+          .withAllowOriginAll(new StaticFileServer[F](cli.entryFile).routes)
           .toResource
 
       server <- EmberServerBuilder
@@ -157,8 +168,12 @@ object LiveServer
         .evalTap { _ =>
           Files[F].currentWorkingDirectory.flatMap { cwd =>
             C.println(
-              s"${AnsiColor.MAGENTA}live server of $cwd started @ http://$host:$port${AnsiColor.RESET}"
-            )
+              s"""|${AnsiColor.MAGENTA}->>Live server of $cwd started at: 
+              |http://$host:$port${AnsiColor.RESET}""".stripMargin
+            ) *>
+              C.println(
+                s"""${AnsiColor.RED}->>Ready to watch changes${AnsiColor.RESET}""".stripMargin
+              )
           }
         }
 
@@ -167,15 +182,15 @@ object LiveServer
 
   override def main: Opts[IO[ExitCode]] = {
 
-    case class Cli(entryFile: Option[String])
-
-    val cli = Opts
+    val host = Opts.option[String]("host", "Host").withDefault("127.0.0.1")
+    val port = Opts.option[Int]("port", "Port").withDefault(8080)
+    val entryFile = Opts
       .option[String]("entry-file", "Index html to be served as entry file")
-      .orNone
-      .map(ef => Cli(ef))
-
+      .withDefault("index.html")
+      .map(ef => fs2.io.file.Path(ef))
+    val cli = (host, port, entryFile).mapN(Cli.apply)
     val app = cli.map(cl =>
-      server[IO](cl.entryFile).use(_ => IO.never[Unit]).as(ExitCode.Success)
+      server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
     )
 
     app
