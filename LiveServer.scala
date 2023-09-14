@@ -1,6 +1,7 @@
 //> using toolkit typelevel:latest
 //> using dep org.http4s::http4s-ember-server:1.0.0-M40
 //> using dep org.http4s::http4s-dsl:1.0.0-M40
+//> using dep com.monovore::decline-effect:2.4.1
 
 import cats.effect.kernel.*
 import fs2.io.file.Files
@@ -25,8 +26,15 @@ import scala.concurrent.duration.*
 import cats.effect.implicits.*
 import org.http4s.server.Server
 import fs2.io.file.Watcher.Event
+import com.monovore.decline._
+import com.monovore.decline.effect._
+import cats.effect.ExitCode
 
-object LiveServer extends cats.effect.IOApp.Simple {
+object LiveServer
+    extends CommandIOApp(
+      name = "live server",
+      header = "Purely functional live server"
+    ) {
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
@@ -74,8 +82,6 @@ object LiveServer extends cats.effect.IOApp.Simple {
             new RuntimeException("Failed to serve index.html")
           )
 
-          _ <- C.print(index)
-
         } yield indexRsp.copy(entity =
           Entity.stream[F](
             fs2.Stream.emit(index).covary[F].through(fs2.text.utf8Encode)
@@ -91,7 +97,7 @@ object LiveServer extends cats.effect.IOApp.Simple {
     val routes = static
   }
 
-  def runF[F[_]: Files](using
+  def server[F[_]: Files](ef: Option[String])(using
       F: Async[F],
       C: Console[F]
   ): Resource[F, Server] = {
@@ -99,17 +105,19 @@ object LiveServer extends cats.effect.IOApp.Simple {
     for {
       host <-
         F.fromOption(
-          Host.fromString("localhost"),
+          Host.fromString("127.0.0.1"),
           new IllegalArgumentException("Invalid host")
         ).toResource
 
       port <-
         F.fromOption(
-          Port.fromInt(8090),
+          Port.fromInt(8080),
           new IllegalArgumentException("Invalid port")
         ).toResource
 
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
+
+      isDotfile = (p: fs2.io.file.Path) => p.fileName.startsWith(".")
 
       _ <- Files[F]
         .watch(fs2.io.file.Path("."))
@@ -119,11 +127,9 @@ object LiveServer extends cats.effect.IOApp.Simple {
           case Event.Deleted(p, _)     => p.some
           case Event.Modified(p, _)    => p.some
           case Event.Overflow(_)       => None
-          case Event.NonStandard(_, _) => None
+          case Event.NonStandard(_, p) => p.some
         }
-        .filterNot(pMaybe =>
-          pMaybe.exists(p => !p.startsWith(fs2.io.file.Path(".")))
-        )
+        .filterNot(pMaybe => pMaybe.exists(p => isDotfile(p)))
         .evalMap { pMaybe =>
           wsOut.offer("reload") *>
             C.println(
@@ -137,9 +143,7 @@ object LiveServer extends cats.effect.IOApp.Simple {
 
       httpRoutes <-
         middleware.CORS.policy
-          .withAllowOriginAll(
-            new StaticFileServer[F](none[String]).routes
-          )
+          .withAllowOriginAll(new StaticFileServer[F](ef).routes)
           .toResource
 
       server <- EmberServerBuilder
@@ -151,13 +155,30 @@ object LiveServer extends cats.effect.IOApp.Simple {
         )
         .build
         .evalTap { _ =>
-          C.println(
-            s"${AnsiColor.MAGENTA}live server started @ $host:$port${AnsiColor.RESET}"
-          )
+          Files[F].currentWorkingDirectory.flatMap { cwd =>
+            C.println(
+              s"${AnsiColor.MAGENTA}live server of $cwd started @ http://$host:$port${AnsiColor.RESET}"
+            )
+          }
         }
 
     } yield server
   }
 
-  override def run: IO[Unit] = runF[IO].use { _ => IO.never }
+  override def main: Opts[IO[ExitCode]] = {
+
+    case class Cli(entryFile: Option[String])
+
+    val cli = Opts
+      .option[String]("entry-file", "Index html to be served as entry file")
+      .orNone
+      .map(ef => Cli(ef))
+
+    val app = cli.map(cl =>
+      server[IO](cl.entryFile).use(_ => IO.never[Unit]).as(ExitCode.Success)
+    )
+
+    app
+
+  }
 }
