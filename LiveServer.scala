@@ -62,6 +62,12 @@ object LiveServer
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
+
+      case GET -> Root / fileName =>
+        StaticFile
+          .fromPath[F](fs2.io.file.Path(fileName))
+          .getOrElseF(NotFound())
+
       case GET -> Root =>
         for {
           injected <- Files[F]
@@ -89,16 +95,8 @@ object LiveServer
             new RuntimeException("Failed to serve index.html")
           )
 
-        } yield indexRsp.copy(entity =
-          Entity.stream[F](
-            fs2.Stream.emit(index).covary[F].through(fs2.text.utf8.encode)
-          )
-        )
+        } yield Response(entity = Entity.utf8String(index))
 
-      case GET -> Root / fileName =>
-        StaticFile
-          .fromPath[F](fs2.io.file.Path(fileName))
-          .getOrElseF(NotFound())
     }
 
     val routes = static
