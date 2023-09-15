@@ -30,6 +30,7 @@ import com.monovore.decline._
 import com.monovore.decline.effect._
 import cats.effect.ExitCode
 import fs2.io.net.Network
+import org.typelevel.ci.CIString
 
 object LiveServer
     extends CommandIOApp(
@@ -40,7 +41,9 @@ object LiveServer
   case class Cli(
       host: String,
       port: Int,
-      entryFile: fs2.io.file.Path
+      wait0: Int,
+      entryFile: fs2.io.file.Path,
+      ignore: Option[List[String]]
   )
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
@@ -64,23 +67,29 @@ object LiveServer
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
 
       case GET -> Root / fileName =>
-        StaticFile
+        C.print(s"$fileName") *> StaticFile
           .fromPath[F](fs2.io.file.Path(fileName))
           .getOrElseF(NotFound())
 
       case GET -> Root =>
         for {
-          injected <- Files[F]
-            .readAll(fs2.io.file.Path("injected.html"))
+
+          indexRsp <- StaticFile.fromPath[F](entryFile).getOrElseF(NotFound())
+
+          injected <- StaticFile
+            .fromPath[F](fs2.io.file.Path("injected.html"))
+            .getOrElseF(NotFound())
+
+          _ <- C.println(injected.entity.length)
+
+          _ <- C.println(indexRsp.entity.length)
+
+          indexBody <- indexRsp.body
             .through(fs2.text.utf8.decode)
             .compile
             .lastOrError
 
-          indexRsp <- StaticFile
-            .fromPath[F](entryFile)
-            .getOrElseF(NotFound())
-
-          indexBody <- indexRsp.body
+          injectedBody <- injected.body
             .through(fs2.text.utf8.decode)
             .compile
             .lastOrError
@@ -91,12 +100,15 @@ object LiveServer
                 case -1 => None
                 case ix => ix.some
               }
-            } yield indexBody.patch(ix, injected, 0),
+            } yield indexBody.patch(ix, injectedBody, 0),
             new RuntimeException("Failed to serve index.html")
           )
 
-        } yield Response(entity = Entity.utf8String(index))
+          foo = indexRsp.withEntity(index).withContentType(`Content-Type`())
 
+          _ <- C.println(foo.entity.length)
+
+        } yield foo
     }
 
     val routes = static
@@ -123,12 +135,19 @@ object LiveServer
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
       doNotWatch = (p: fs2.io.file.Path) =>
-        F.pure(p.names.exists(_.toString.startsWith(".")))
+        F.pure {
+          cli.ignore
+            .fold(false :: Nil)(rgxs =>
+              rgxs.map(rgx => rgx.r.findFirstIn(p.toString).isDefined)
+            )
+            .reduce(_ || _)
+        }
+        // F.pure(p.names.exists(_.toString.startsWith(".")))
 
       _ <- Files[F].currentWorkingDirectory.flatMap { cwd =>
         Files[F]
           .watch(cwd)
-          .debounce(1.second)
+          .debounce(cli.wait0.milliseconds)
           .map {
             case Event.Created(p, _)     => p.some
             case Event.Deleted(p, _)     => p.some
@@ -160,7 +179,7 @@ object LiveServer
         .withHost(host)
         .withPort(port)
         .withHttpWebSocketApp(wsb =>
-          (httpRoutes <+> new Websocket[F](wsb, wsOut).routes).orNotFound
+          (new Websocket[F](wsb, wsOut).routes <+> httpRoutes).orNotFound
         )
         .build
         .evalTap { _ =>
@@ -181,12 +200,24 @@ object LiveServer
   override def main: Opts[IO[ExitCode]] = {
 
     val host = Opts.option[String]("host", "Host").withDefault("127.0.0.1")
+
     val port = Opts.option[Int]("port", "Port").withDefault(8080)
+
+    val wait0 =
+      Opts.option[Int]("wait", "Wait before reload (ms)").withDefault(1000)
+
     val entryFile = Opts
       .option[String]("entry-file", "Index html to be served as entry file")
       .withDefault("index.html")
       .map(ef => fs2.io.file.Path(ef))
-    val cli = (host, port, entryFile).mapN(Cli.apply)
+
+    val ignore = Opts
+      .options[String]("ignore", "List of path regex to not watch")
+      .map(_.toList)
+      .orNone
+
+    val cli = (host, port, wait0, entryFile, ignore).mapN(Cli.apply)
+
     val app = cli.map(cl =>
       server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
     )
