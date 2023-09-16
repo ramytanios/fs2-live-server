@@ -96,7 +96,6 @@ object LiveServer
 
       case GET -> Root =>
         for {
-
           index <- Files[F].readUtf8(entryFile).compile.lastOrError
           script <- Files[F].readUtf8(injectedPath).compile.lastOrError
           index0 <- F.fromOption(
@@ -136,7 +135,7 @@ object LiveServer
 
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
-      doNotWatch = (p: fs2.io.file.Path) =>
+      doNotWatchPath = (p: fs2.io.file.Path) =>
         F.pure {
           cli.ignore
             .fold(false :: Nil)(rgxs =>
@@ -145,28 +144,30 @@ object LiveServer
             .reduce(_ || _)
         }
 
-      eventsQ <- cats.effect.std.Queue.unbounded[F, Event].toResource
-
-      cwd <- Files[F].currentWorkingDirectory.toResource
-
-      _ <- (cli.watch match {
-        case Some(ps) => ps.map(p => fs2.io.file.Path(p))
-        case None     => cwd :: Nil
-      }).map(p => Files[F].watch(p).evalMap(eventsQ.offer).compile.drain)
-        .parSequence
-        .background
-
-      _ <- fs2.Stream
-        .fromQueueUnterminated(eventsQ)
-        .debounce(cli.wait0.milliseconds)
-        .map {
+      pathFromEvent = (e: Event) =>
+        e match {
           case Event.Created(p, _)     => p.some
           case Event.Deleted(p, _)     => p.some
           case Event.Modified(p, _)    => p.some
           case Event.Overflow(_)       => None
           case Event.NonStandard(_, p) => p.some
         }
-        .evalFilterNot(pMaybe => pMaybe.existsM(doNotWatch))
+
+      eventQ <- cats.effect.std.Queue.unbounded[F, Event].toResource
+
+      cwd <- Files[F].currentWorkingDirectory.toResource
+
+      _ <- cli.watch
+        .fold(cwd :: Nil)(_.map(p => fs2.io.file.Path(p)))
+        .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
+        .parSequence
+        .background
+
+      _ <- fs2.Stream
+        .fromQueueUnterminated(eventQ)
+        .debounce(cli.wait0.milliseconds)
+        .map(pathFromEvent)
+        .evalFilterNot(_.existsM(doNotWatchPath))
         .evalMap { pMaybe =>
           wsOut.offer("reload") *>
             C.println(
