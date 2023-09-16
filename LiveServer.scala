@@ -31,6 +31,7 @@ import com.monovore.decline.effect._
 import cats.effect.ExitCode
 import fs2.io.net.Network
 import org.typelevel.ci.CIString
+import org.http4s.headers.`Content-Type`
 
 object LiveServer
     extends CommandIOApp(
@@ -43,7 +44,8 @@ object LiveServer
       port: Int,
       wait0: Int,
       entryFile: fs2.io.file.Path,
-      ignore: Option[List[String]]
+      ignore: Option[List[String]],
+      watch: Option[List[String]]
   )
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
@@ -60,6 +62,25 @@ object LiveServer
     }
   }
 
+  def injectScriptInHtml(html: String, script: String): Option[String] =
+    html.indexOf("</script>") match {
+      case -1 =>
+        html.indexOf("</html>") match {
+          case -1 => None
+          case ix =>
+            html
+              .patch(
+                ix,
+                s"""|<script type="text/javascript">
+                  |$script
+                  |</script>""".stripMargin,
+                0
+              )
+              .some
+        }
+      case ix => html.patch(ix, script, 0).some
+    }
+
   final class StaticFileServer[F[_]: Files: LoggerFactory](
       entryFile: fs2.io.file.Path
   )(using F: Concurrent[F], C: Console[F])
@@ -67,48 +88,37 @@ object LiveServer
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
 
       case GET -> Root / fileName =>
-        C.print(s"$fileName") *> StaticFile
+        StaticFile
           .fromPath[F](fs2.io.file.Path(fileName))
           .getOrElseF(NotFound())
 
       case GET -> Root =>
         for {
 
-          indexRsp <- StaticFile.fromPath[F](entryFile).getOrElseF(NotFound())
-
-          injected <- StaticFile
-            .fromPath[F](fs2.io.file.Path("injected.html"))
-            .getOrElseF(NotFound())
-
-          _ <- C.println(injected.entity.length)
-
-          _ <- C.println(indexRsp.entity.length)
-
-          indexBody <- indexRsp.body
-            .through(fs2.text.utf8.decode)
+          index <- Files[F]
+            .readUtf8(entryFile)
             .compile
             .lastOrError
 
-          injectedBody <- injected.body
-            .through(fs2.text.utf8.decode)
+          script <- Files[F]
+            .readUtf8(fs2.io.file.Path("injected.js"))
             .compile
             .lastOrError
 
-          index <- F.fromOption(
-            for {
-              ix <- indexBody.indexOf("</html>") match {
-                case -1 => None
-                case ix => ix.some
-              }
-            } yield indexBody.patch(ix, injectedBody, 0),
+          index0 <- F.fromOption(
+            injectScriptInHtml(index, script),
             new RuntimeException("Failed to serve index.html")
           )
 
-          foo = indexRsp.withEntity(index).withContentType(`Content-Type`())
+          mediaType <- F.fromOption(
+            MediaType.forExtension("html"),
+            new RuntimeException("Invalid media type")
+          )
 
-          _ <- C.println(foo.entity.length)
+        } yield Response()
+          .withEntity(index0)
+          .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
 
-        } yield foo
     }
 
     val routes = static
@@ -142,32 +152,46 @@ object LiveServer
             )
             .reduce(_ || _)
         }
-        // F.pure(p.names.exists(_.toString.startsWith(".")))
 
-      _ <- Files[F].currentWorkingDirectory.flatMap { cwd =>
-        Files[F]
-          .watch(cwd)
-          .debounce(cli.wait0.milliseconds)
-          .map {
-            case Event.Created(p, _)     => p.some
-            case Event.Deleted(p, _)     => p.some
-            case Event.Modified(p, _)    => p.some
-            case Event.Overflow(_)       => None
-            case Event.NonStandard(_, p) => p.some
-          }
-          .evalFilterNot(pMaybe => pMaybe.existsM(doNotWatch))
-          .evalMap { pMaybe =>
-            wsOut.offer("reload") *>
-              C.println(
-                s"""->>${AnsiColor.CYAN}Changes detected ${pMaybe
-                    .map(p => s"at `$p`")
-                    .getOrElse("")}${AnsiColor.RESET}"""
-              )
+      eventsQ <- cats.effect.std.Queue.unbounded[F, Event].toResource
 
-          }
-          .compile
-          .drain
+      _ <- (cli.watch match {
+        case Some(ps) => F.pure(ps.map(p => fs2.io.file.Path(p)))
+        case None     => Files[F].currentWorkingDirectory.map(_ :: Nil)
+      }).flatMap { ps =>
+        ps.map(p =>
+          Files[F]
+            .watch(p)
+            .evalMap { event => eventsQ.offer(event) }
+            .covary[F]
+            .compile
+            .drain
+        ).parSequence
       }.background
+
+      _ <- fs2.Stream
+        .fromQueueUnterminated(eventsQ)
+        .debounce(cli.wait0.milliseconds)
+        .map {
+          case Event.Created(p, _)     => p.some
+          case Event.Deleted(p, _)     => p.some
+          case Event.Modified(p, _)    => p.some
+          case Event.Overflow(_)       => None
+          case Event.NonStandard(_, p) => p.some
+        }
+        .evalFilterNot(pMaybe => pMaybe.existsM(doNotWatch))
+        .evalMap { pMaybe =>
+          wsOut.offer("reload") *>
+            C.println(
+              s"""->>${AnsiColor.CYAN}Changes detected ${pMaybe
+                  .map(p => s"at `$p`")
+                  .getOrElse("")}${AnsiColor.RESET}"""
+            )
+
+        }
+        .compile
+        .drain
+        .background
 
       httpRoutes <-
         middleware.CORS.policy
@@ -216,7 +240,12 @@ object LiveServer
       .map(_.toList)
       .orNone
 
-    val cli = (host, port, wait0, entryFile, ignore).mapN(Cli.apply)
+    val watch = Opts
+      .options[String]("watch", "List of paths to watch")
+      .map(_.toList)
+      .orNone
+
+    val cli = (host, port, wait0, entryFile, ignore, watch).mapN(Cli.apply)
 
     val app = cli.map(cl =>
       server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
