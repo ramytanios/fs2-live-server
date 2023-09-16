@@ -85,8 +85,10 @@ object LiveServer
       entryFile: fs2.io.file.Path
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
-    private val static: HttpRoutes[F] = HttpRoutes.of[F] {
 
+    val injectedPath = fs2.io.file.Path("injected.js")
+
+    private val static: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root / fileName =>
         StaticFile
           .fromPath[F](fs2.io.file.Path(fileName))
@@ -95,26 +97,16 @@ object LiveServer
       case GET -> Root =>
         for {
 
-          index <- Files[F]
-            .readUtf8(entryFile)
-            .compile
-            .lastOrError
-
-          script <- Files[F]
-            .readUtf8(fs2.io.file.Path("injected.js"))
-            .compile
-            .lastOrError
-
+          index <- Files[F].readUtf8(entryFile).compile.lastOrError
+          script <- Files[F].readUtf8(injectedPath).compile.lastOrError
           index0 <- F.fromOption(
             injectScriptInHtml(index, script),
             new RuntimeException("Failed to serve index.html")
           )
-
           mediaType <- F.fromOption(
             MediaType.forExtension("html"),
             new RuntimeException("Invalid media type")
           )
-
         } yield Response()
           .withEntity(index0)
           .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
@@ -155,19 +147,14 @@ object LiveServer
 
       eventsQ <- cats.effect.std.Queue.unbounded[F, Event].toResource
 
+      cwd <- Files[F].currentWorkingDirectory.toResource
+
       _ <- (cli.watch match {
-        case Some(ps) => F.pure(ps.map(p => fs2.io.file.Path(p)))
-        case None     => Files[F].currentWorkingDirectory.map(_ :: Nil)
-      }).flatMap { ps =>
-        ps.map(p =>
-          Files[F]
-            .watch(p)
-            .evalMap { event => eventsQ.offer(event) }
-            .covary[F]
-            .compile
-            .drain
-        ).parSequence
-      }.background
+        case Some(ps) => ps.map(p => fs2.io.file.Path(p))
+        case None     => cwd :: Nil
+      }).map(p => Files[F].watch(p).evalMap(eventsQ.offer).compile.drain)
+        .parSequence
+        .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventsQ)
@@ -207,15 +194,12 @@ object LiveServer
         )
         .build
         .evalTap { _ =>
-          Files[F].currentWorkingDirectory.flatMap { cwd =>
-            C.println(
-              s"""|${AnsiColor.MAGENTA}->>Live server of $cwd started at: 
+          C.println(
+            s"""|${AnsiColor.MAGENTA}->>Live server of $cwd started at: 
               |http://$host:$port${AnsiColor.RESET}""".stripMargin
-            ) *>
-              C.println(
-                s"""${AnsiColor.RED}->>Ready to watch changes${AnsiColor.RESET}""".stripMargin
-              )
-          }
+          ) *> C.println(
+            s"""${AnsiColor.RED}->>Ready to watch changes${AnsiColor.RESET}""".stripMargin
+          )
         }
 
     } yield server
