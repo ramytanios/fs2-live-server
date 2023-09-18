@@ -1,5 +1,6 @@
 //> using toolkit typelevel:latest
 //> using dep org.http4s::http4s-ember-server:1.0.0-M40
+//> using dep org.http4s::http4s-ember-client:1.0.0-M40
 //> using dep org.http4s::http4s-dsl:1.0.0-M40
 //> using dep com.monovore::decline-effect:2.4.1
 
@@ -32,6 +33,11 @@ import cats.effect.ExitCode
 import fs2.io.net.Network
 import org.typelevel.ci.CIString
 import org.http4s.headers.`Content-Type`
+import cats.data.Kleisli
+import java.net.http.HttpClient
+import org.http4s.client.Client
+import org.http4s.ember.client.EmberClientBuilder
+import org.http4s.Uri.Path.Segment
 
 object LiveServer
     extends CommandIOApp(
@@ -45,7 +51,8 @@ object LiveServer
       wait0: Int,
       entryFile: fs2.io.file.Path,
       ignore: Option[List[String]],
-      watch: Option[List[String]]
+      watch: Option[List[String]],
+      proxy: Option[String]
   )
 
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
@@ -115,6 +122,36 @@ object LiveServer
     val routes = static
   }
 
+  final class ProxyMiddleware[F[_]: Async: LoggerFactory](
+      httpApp: HttpRoutes[F],
+      path: String,
+      url: String,
+      httpClient: Client[F]
+  ) extends Http4sDsl[F] {
+    private val newUri = Uri.fromString(url)
+    def default(): HttpRoutes[F] =
+      Kleisli { req =>
+        req.uri match {
+          case Uri(_, _, path0, _, _)
+              if path0.segments.toList.startsWith(Segment(path) :: Nil) =>
+            cats.data.OptionT.liftF(
+              Async[F].delay {
+                println(
+                  s"PROXIED: $path -- ${Segment(path)} -- ${path0.segments} -- $newUri "
+                )
+              } *>
+                Async[F]
+                  .fromEither(newUri)
+                  .flatMap(uri => {
+                    val newReq = req.withUri(uri)
+                    httpClient.stream(req).compile.lastOrError
+                  })
+            )
+          case _ => httpApp(req)
+        }
+      }
+  }
+
   def server[F[_]: Files: Network](cli: Cli)(using
       F: Async[F],
       C: Console[F]
@@ -157,6 +194,8 @@ object LiveServer
 
       cwd <- Files[F].currentWorkingDirectory.toResource
 
+      httpClient <- EmberClientBuilder.default[F].build
+
       _ <- cli.watch
         .fold(cwd :: Nil)(_.map(p => fs2.io.file.Path(p)))
         .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
@@ -186,12 +225,25 @@ object LiveServer
           .withAllowOriginAll(new StaticFileServer[F](cli.entryFile).routes)
           .toResource
 
+      proxiedRoutes <- cli.proxy.fold(F.pure(httpRoutes))(proxy =>
+        F.fromOption(
+          for {
+            path <- proxy.split(":").headOption
+            url <- proxy.split(":").tail.headOption
+          } yield (path, url),
+          new RuntimeException("Bad proxy settings")
+        ).map { case (path, url) =>
+          ProxyMiddleware(httpRoutes, path, url, httpClient)
+            .default()
+        }
+      ).toResource
+
       server <- EmberServerBuilder
         .default[F]
         .withHost(host)
         .withPort(port)
         .withHttpWebSocketApp(wsb =>
-          (new Websocket[F](wsb, wsOut).routes <+> httpRoutes).orNotFound
+          (new Websocket[F](wsb, wsOut).routes <+> proxiedRoutes).orNotFound
         )
         .build
         .evalTap { _ =>
@@ -230,7 +282,13 @@ object LiveServer
       .map(_.toList)
       .orNone
 
-    val cli = (host, port, wait0, entryFile, ignore, watch).mapN(Cli.apply)
+    val proxy = Opts
+      .option[String]("proxy", "Proxy routes to URL, format ROUTE:URL")
+      .orNone
+      // .validate
+
+    val cli =
+      (host, port, wait0, entryFile, ignore, watch, proxy).mapN(Cli.apply)
 
     val app = cli.map(cl =>
       server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
