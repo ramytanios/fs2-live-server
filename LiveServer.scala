@@ -69,24 +69,26 @@ object LiveServer
     }
   }
 
-  def injectScriptInHtml(html: String, script: String): Option[String] =
-    html.indexOf("</script>") match {
-      case -1 =>
-        html.indexOf("</html>") match {
-          case -1 => None
-          case ix =>
-            html
-              .patch(
-                ix,
-                s"""|<script type="text/javascript">
+  object ScriptInjector {
+    def apply(html: String, script: String): Option[String] =
+      html.indexOf("</script>") match {
+        case -1 =>
+          html.indexOf("</html>") match {
+            case -1 => None
+            case ix =>
+              html
+                .patch(
+                  ix,
+                  s"""|<script type="text/javascript">
                   |$script
                   |</script>""".stripMargin,
-                0
-              )
-              .some
-        }
-      case ix => html.patch(ix, script, 0).some
-    }
+                  0
+                )
+                .some
+          }
+        case ix => html.patch(ix, script, 0).some
+      }
+  }
 
   final class StaticFileServer[F[_]: Files: LoggerFactory](
       entryFile: fs2.io.file.Path
@@ -106,7 +108,7 @@ object LiveServer
           index <- Files[F].readUtf8(entryFile).compile.lastOrError
           script <- Files[F].readUtf8(injectedPath).compile.lastOrError
           index0 <- F.fromOption(
-            injectScriptInHtml(index, script),
+            ScriptInjector(index, script),
             new RuntimeException("Failed to serve index.html")
           )
           mediaType <- F.fromOption(
@@ -122,40 +124,35 @@ object LiveServer
     val routes = static
   }
 
-  final class ProxyMiddleware[F[_]: Async: LoggerFactory](
-      httpApp: HttpRoutes[F],
-      path: String,
-      url: String,
-      httpClient: Client[F]
-  ) extends Http4sDsl[F] {
-    private val newUri = Uri.fromString(url)
-    def default(): HttpRoutes[F] =
+  object ProxyMiddleware {
+
+    def default[F[_]: LoggerFactory](
+        httpApp: HttpRoutes[F],
+        path: String,
+        url: String,
+        client: Client[F]
+    )(using F: Async[F]): HttpRoutes[F] = {
+      val newUriMaybe = Uri.fromString(url)
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
               if path0.segments.toList.startsWith(Segment(path) :: Nil) =>
             cats.data.OptionT.liftF(
-              Async[F].delay {
-                println(
-                  s"PROXIED: $path -- ${Segment(path)} -- ${path0.segments} -- $newUri "
-                )
-              } *>
-                Async[F]
-                  .fromEither(newUri)
-                  .flatMap(uri => {
-                    val newReq = req.withUri(uri)
-                    httpClient.stream(req).compile.lastOrError
-                  })
+              F.fromEither(newUriMaybe)
+                .flatMap(uri => {
+                  val newReq = req.withUri(uri.withPath(path0))
+                  client.stream(newReq).compile.lastOrError
+                })
             )
           case _ => httpApp(req)
         }
       }
+    }
   }
 
-  def server[F[_]: Files: Network](cli: Cli)(using
-      F: Async[F],
-      C: Console[F]
-  ): Resource[F, Server] = {
+  def server[F[_]: Files: Network](
+      cli: Cli
+  )(using F: Async[F], C: Console[F]): Resource[F, Server] = {
     implicit val loggerFactory: LoggerFactory[F] = Slf4jFactory.create[F]
     for {
       host <-
@@ -194,8 +191,6 @@ object LiveServer
 
       cwd <- Files[F].currentWorkingDirectory.toResource
 
-      httpClient <- EmberClientBuilder.default[F].build
-
       _ <- cli.watch
         .fold(cwd :: Nil)(_.map(p => fs2.io.file.Path(p)))
         .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
@@ -220,30 +215,30 @@ object LiveServer
         .drain
         .background
 
-      httpRoutes <-
-        middleware.CORS.policy
-          .withAllowOriginAll(new StaticFileServer[F](cli.entryFile).routes)
-          .toResource
-
-      proxiedRoutes <- cli.proxy.fold(F.pure(httpRoutes))(proxy =>
-        F.fromOption(
-          for {
-            path <- proxy.split(":").headOption
-            url <- proxy.split(":").tail.headOption
-          } yield (path, url),
-          new RuntimeException("Bad proxy settings")
-        ).map { case (path, url) =>
-          ProxyMiddleware(httpRoutes, path, url, httpClient)
-            .default()
-        }
-      ).toResource
+      app <- middleware.CORS.policy
+        .withAllowOriginAll(new StaticFileServer[F](cli.entryFile).routes)
+        .flatMap { app =>
+          cli.proxy.fold(F.pure(app))(proxy =>
+            F.fromOption(
+              for {
+                path <- proxy.split(":").headOption
+                url <- proxy.split(":").tail.mkString(":").some
+              } yield (path, url),
+              new RuntimeException("Bad proxy settings")
+            ).flatMap { case (path, url) =>
+              EmberClientBuilder.default[F].build.use { client =>
+                F.delay(ProxyMiddleware.default(app, path, url, client))
+              }
+            }
+          )
+        }.toResource
 
       server <- EmberServerBuilder
         .default[F]
         .withHost(host)
         .withPort(port)
         .withHttpWebSocketApp(wsb =>
-          (new Websocket[F](wsb, wsOut).routes <+> proxiedRoutes).orNotFound
+          (new Websocket[F](wsb, wsOut).routes <+> app).orNotFound
         )
         .build
         .evalTap { _ =>
@@ -285,7 +280,7 @@ object LiveServer
     val proxy = Opts
       .option[String]("proxy", "Proxy routes to URL, format ROUTE:URL")
       .orNone
-      // .validate
+    // .validate
 
     val cli =
       (host, port, wait0, entryFile, ignore, watch, proxy).mapN(Cli.apply)
