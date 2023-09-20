@@ -12,7 +12,7 @@ import org.http4s.websocket.WebSocketFrame
 import org.http4s.server.middleware
 import com.comcast.ip4s.*
 import org.http4s.ember.server.EmberServerBuilder
-import fs2.io.file.Path
+import fs2.io.file.{Path => PathFs2}
 import cats.syntax.all.*
 import org.typelevel.log4cats.LoggerFactory
 import org.http4s.dsl.io.*
@@ -27,8 +27,8 @@ import scala.concurrent.duration.*
 import cats.effect.implicits.*
 import org.http4s.server.Server
 import fs2.io.file.Watcher.Event
-import com.monovore.decline._
-import com.monovore.decline.effect._
+import com.monovore.decline.*
+import com.monovore.decline.effect.*
 import cats.effect.ExitCode
 import fs2.io.net.Network
 import org.typelevel.ci.CIString
@@ -37,7 +37,7 @@ import cats.data.Kleisli
 import java.net.http.HttpClient
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
-import org.http4s.Uri.Path.Segment
+import org.http4s.Uri.{Path => UriPath}
 
 object LiveServer
     extends CommandIOApp(
@@ -49,12 +49,15 @@ object LiveServer
       host: String,
       port: Int,
       wait0: Int,
-      entryFile: fs2.io.file.Path,
+      entryFile: PathFs2,
       ignore: Option[List[String]],
       watch: Option[List[String]],
-      proxy: Option[String]
+      proxy: Option[String],
+      cors: Boolean,
+      verbose: Boolean
   )
 
+  // websocket connection
   final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
   ) extends Http4sDsl[F] {
@@ -69,6 +72,7 @@ object LiveServer
     }
   }
 
+  // script injector
   object ScriptInjector {
     def apply(html: String, script: String): Option[String] =
       html.indexOf("</script>") match {
@@ -90,17 +94,18 @@ object LiveServer
       }
   }
 
+  // static file server
   final class StaticFileServer[F[_]: Files: LoggerFactory](
-      entryFile: fs2.io.file.Path
+      entryFile: PathFs2
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    val injectedPath = fs2.io.file.Path("injected.js")
+    val injectedPath = PathFs2("injected.js")
 
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root / fileName =>
         StaticFile
-          .fromPath[F](fs2.io.file.Path(fileName))
+          .fromPath[F](PathFs2(fileName))
           .getOrElseF(NotFound())
 
       case GET -> Root =>
@@ -124,8 +129,8 @@ object LiveServer
     val routes = static
   }
 
+  // proxy middleware
   object ProxyMiddleware {
-
     def default[F[_]: LoggerFactory](
         httpApp: HttpRoutes[F],
         path: String,
@@ -136,12 +141,12 @@ object LiveServer
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
-              if path0.segments.toList.startsWith(Segment(path) :: Nil) =>
+              if path0.segments.headOption.exists(_ == UriPath.Segment(path)) =>
             cats.data.OptionT.liftF(
               F.fromEither(newUriMaybe)
                 .flatMap(uri => {
                   val newReq = req.withUri(uri.withPath(path0))
-                  client.stream(newReq).compile.lastOrError
+                    client.stream(newReq).compile.lastOrError
                 })
             )
           case _ => httpApp(req)
@@ -169,7 +174,7 @@ object LiveServer
 
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
-      doNotWatchPath = (p: fs2.io.file.Path) =>
+      doNotWatchPath = (p: PathFs2) =>
         F.pure {
           cli.ignore
             .fold(false :: Nil)(rgxs =>
@@ -192,7 +197,7 @@ object LiveServer
       cwd <- Files[F].currentWorkingDirectory.toResource
 
       _ <- cli.watch
-        .fold(cwd :: Nil)(_.map(p => fs2.io.file.Path(p)))
+        .fold(cwd :: Nil)(_.map(p => PathFs2(p)))
         .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
         .parSequence
         .background
@@ -215,23 +220,41 @@ object LiveServer
         .drain
         .background
 
-      app <- middleware.CORS.policy
-        .withAllowOriginAll(new StaticFileServer[F](cli.entryFile).routes)
-        .flatMap { app =>
-          cli.proxy.fold(F.pure(app))(proxy =>
-            F.fromOption(
-              for {
-                path <- proxy.split(":").headOption
-                url <- proxy.split(":").tail.mkString(":").some
-              } yield (path, url),
-              new RuntimeException("Bad proxy settings")
-            ).flatMap { case (path, url) =>
-              EmberClientBuilder.default[F].build.use { client =>
-                F.delay(ProxyMiddleware.default(app, path, url, client))
+      app <- {
+        val app0 = new StaticFileServer[F](cli.entryFile).routes
+        for {
+          // CORS middleware
+          app0 <-
+            if (cli.cors) {
+              middleware.CORS.policy.withAllowOriginAll(app0)
+            } else F.pure { app0 }
+          // proxy middleware
+          app1 <- cli.proxy
+            .fold(F.pure(app0))(proxy =>
+              F.fromOption(
+                for {
+                  path <- proxy.split(":").headOption
+                  url <- proxy.split(":").tail.mkString(":").some
+                } yield (path, url),
+                new RuntimeException("Bad proxy settings")
+              ).flatMap { case (path, url) =>
+                EmberClientBuilder.default[F].build.use { client =>
+                  F.delay(ProxyMiddleware.default(app0, path, url, client))
+                }
               }
-            }
-          )
-        }.toResource
+            )
+          // logging middleware
+          app2 =
+            if (cli.verbose) {
+              middleware.Logger.httpRoutes[F](
+                logHeaders = true,
+                logBody = true,
+                logAction = ((msg: String) => C.println(msg)).some
+              )(app1)
+            } else { app1 }
+
+        } yield app2
+      }.toResource
 
       server <- EmberServerBuilder
         .default[F]
@@ -265,7 +288,7 @@ object LiveServer
     val entryFile = Opts
       .option[String]("entry-file", "Index html to be served as entry file")
       .withDefault("index.html")
-      .map(ef => fs2.io.file.Path(ef))
+      .map(ef => PathFs2(ef))
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
@@ -280,10 +303,17 @@ object LiveServer
     val proxy = Opts
       .option[String]("proxy", "Proxy routes to URL, format ROUTE:URL")
       .orNone
-    // .validate
+
+    val cors =
+      Opts.flag("cors", "Allow any origin requests").orFalse
+
+    val verbose =
+      Opts.flag("verbose", "Logs all requests and responses", "V").orFalse
 
     val cli =
-      (host, port, wait0, entryFile, ignore, watch, proxy).mapN(Cli.apply)
+      (host, port, wait0, entryFile, ignore, watch, proxy, cors, verbose).mapN(
+        Cli.apply
+      )
 
     val app = cli.map(cl =>
       server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
