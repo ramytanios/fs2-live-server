@@ -3,6 +3,7 @@
 //> using dep org.http4s::http4s-ember-client:1.0.0-M40
 //> using dep org.http4s::http4s-dsl:1.0.0-M40
 //> using dep com.monovore::decline-effect:2.4.1
+//> using dep ch.qos.logback:logback-classic:1.4.11
 
 import cats.effect.kernel.*
 import fs2.io.file.Files
@@ -12,7 +13,7 @@ import org.http4s.websocket.WebSocketFrame
 import org.http4s.server.middleware
 import com.comcast.ip4s.*
 import org.http4s.ember.server.EmberServerBuilder
-import fs2.io.file.{Path => PathFs2}
+import fs2.io.file.{Path => Fs2Path}
 import cats.syntax.all.*
 import org.typelevel.log4cats.LoggerFactory
 import org.http4s.dsl.io.*
@@ -49,7 +50,7 @@ object LiveServer
       host: String,
       port: Int,
       wait0: Int,
-      entryFile: PathFs2,
+      entryFile: Fs2Path,
       ignore: Option[List[String]],
       watch: Option[List[String]],
       proxy: Option[String],
@@ -96,16 +97,16 @@ object LiveServer
 
   // static file server
   final class StaticFileServer[F[_]: Files: LoggerFactory](
-      entryFile: PathFs2
+      entryFile: Fs2Path
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    val injectedPath = PathFs2("injected.js")
+    val injectedPath = Fs2Path("injected.js")
 
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root / fileName =>
         StaticFile
-          .fromPath[F](PathFs2(fileName))
+          .fromPath[F](Fs2Path(fileName))
           .getOrElseF(NotFound())
 
       case GET -> Root =>
@@ -146,7 +147,7 @@ object LiveServer
               F.fromEither(newUriMaybe)
                 .flatMap(uri => {
                   val newReq = req.withUri(uri.withPath(path0))
-                    client.stream(newReq).compile.lastOrError
+                  client.stream(newReq).compile.lastOrError
                 })
             )
           case _ => httpApp(req)
@@ -172,9 +173,11 @@ object LiveServer
           new IllegalArgumentException("Invalid port")
         ).toResource
 
+      logger <- loggerFactory.create.toResource
+
       wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
 
-      doNotWatchPath = (p: PathFs2) =>
+      doNotWatchPath = (p: Fs2Path) =>
         F.pure {
           cli.ignore
             .fold(false :: Nil)(rgxs =>
@@ -197,7 +200,7 @@ object LiveServer
       cwd <- Files[F].currentWorkingDirectory.toResource
 
       _ <- cli.watch
-        .fold(cwd :: Nil)(_.map(p => PathFs2(p)))
+        .fold(cwd :: Nil)(_.map(p => Fs2Path(p)))
         .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
         .parSequence
         .background
@@ -221,13 +224,13 @@ object LiveServer
         .background
 
       app <- {
-        val app0 = new StaticFileServer[F](cli.entryFile).routes
+        val sf = new StaticFileServer[F](cli.entryFile).routes
         for {
           // CORS middleware
           app0 <-
             if (cli.cors) {
-              middleware.CORS.policy.withAllowOriginAll(app0)
-            } else F.pure { app0 }
+              middleware.CORS.policy.withAllowOriginAll(sf)
+            } else F.pure(sf)
           // proxy middleware
           app1 <- cli.proxy
             .fold(F.pure(app0))(proxy =>
@@ -249,9 +252,9 @@ object LiveServer
               middleware.Logger.httpRoutes[F](
                 logHeaders = true,
                 logBody = true,
-                logAction = ((msg: String) => C.println(msg)).some
+                logAction = ((msg: String) => logger.info(msg)).some
               )(app1)
-            } else { app1 }
+            } else app1
 
         } yield app2
       }.toResource
@@ -288,7 +291,7 @@ object LiveServer
     val entryFile = Opts
       .option[String]("entry-file", "Index html to be served as entry file")
       .withDefault("index.html")
-      .map(ef => PathFs2(ef))
+      .map(ef => Fs2Path(ef))
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
