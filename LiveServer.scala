@@ -19,8 +19,8 @@ import org.typelevel.log4cats.LoggerFactory
 import org.http4s.dsl.io.*
 import org.typelevel.log4cats.slf4j.Slf4jFactory
 import cats.effect.IO
-import org.http4s._
-import org.http4s.dsl._
+import org.http4s.*
+import org.http4s.dsl.*
 import org.http4s.dsl.impl.Responses.NotFoundOps
 import cats.effect.std.Console
 import scala.io.AnsiColor
@@ -76,21 +76,8 @@ object LiveServer
   // script injector
   object ScriptInjector {
     def apply(html: String, script: String): Option[String] =
-      html.indexOf("</script>") match {
-        case -1 =>
-          html.indexOf("</html>") match {
-            case -1 => None
-            case ix =>
-              html
-                .patch(
-                  ix,
-                  s"""|<script type="text/javascript">
-                  |$script
-                  |</script>""".stripMargin,
-                  0
-                )
-                .some
-          }
+      html.indexOf("</html>") match {
+        case -1 => None
         case ix => html.patch(ix, script, 0).some
       }
   }
@@ -101,7 +88,7 @@ object LiveServer
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    val injectedPath = Fs2Path("injected.js")
+    val injectedPath = Fs2Path("injected.html")
 
     private val static: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root / fileName =>
@@ -259,6 +246,7 @@ object LiveServer
         } yield app2
       }.toResource
 
+      // TODO: add retry logic on failing port
       server <- EmberServerBuilder
         .default[F]
         .withHost(host)
