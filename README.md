@@ -1,5 +1,7 @@
 # fs2-live-server
 
+Scala rewrite of [Live Server](https://github.com/tapio/live-server) 
+
 ```bash
 # build 
 scala-cli --power package LiveServer.scala -f -o ls
