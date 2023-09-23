@@ -49,17 +49,17 @@ object LiveServer
     ) {
 
   case class Cli(
-      host: String,
-      port: Int,
-      wait0: Int,
+      host: Host,
+      port: Port,
+      wait0: FiniteDuration,
       entryFile: Fs2Path,
       ignore: Option[List[String]],
-      watch: Option[List[String]],
+      watch: Option[List[Fs2Path]],
       proxy: Option[String],
       cors: Boolean,
       verbose: Boolean
   ) {
-    def withPort(port: Int) = this.copy(port = port)
+    def withPort(port: Port) = this.copy(port = port)
   }
 
   // websocket connection
@@ -96,7 +96,7 @@ object LiveServer
 
     private val injectedPath = Fs2Path("injected.html")
 
-    private def readFile(path: Fs2Path): F[String] =
+    private def readFileF(path: Fs2Path): F[String] =
       Files[F].readUtf8(path).compile.lastOrError
 
     val routes: HttpRoutes[F] = HttpRoutes.of[F] {
@@ -107,8 +107,8 @@ object LiveServer
 
       case GET -> Root =>
         for {
-          index <- readFile(entryFile)
-          script <- readFile(injectedPath)
+          index <- readFileF(entryFile)
+          script <- readFileF(injectedPath)
           index0 <- F.fromOption(
             ScriptInjector(index, script),
             new RuntimeException("Failed to serve index.html")
@@ -154,17 +154,11 @@ object LiveServer
   )(using F: Async[F], C: Console[F]): F[Unit] = {
     implicit val loggerFactory: LoggerFactory[F] = Slf4jFactory.create[F]
     for {
-      host <- F.fromOption(
-        Host.fromString(cli.host),
-        new IllegalArgumentException("Invalid host")
-      )
-
-      port <- F.fromOption(
-        Port.fromInt(cli.port),
-        new IllegalArgumentException("Invalid port")
-      )
-
       logger <- loggerFactory.create
+
+      cwd <- Files[F].currentWorkingDirectory
+
+      eventQ <- Queue.unbounded[F, Event]
 
       wsOut <- Queue.unbounded[F, String]
 
@@ -186,19 +180,21 @@ object LiveServer
           case Event.NonStandard(_, p) => p.some
         }
 
-      eventQ <- Queue.unbounded[F, Event]
-
-      cwd <- Files[F].currentWorkingDirectory
-
       _ <- cli.watch
-        .fold(cwd :: Nil)(_.map(p => Fs2Path(p)))
-        .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
+        .getOrElse(cwd :: Nil)
+        .map(path =>
+          Files[F]
+            .watch(path)
+            .evalMap(eventQ.offer)
+            .compile
+            .drain
+        )
         .parSequence
         .start
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
-        .debounce(cli.wait0.milliseconds)
+        .debounce(cli.wait0)
         .map(pathFromEvent)
         .evalFilterNot(_.existsM(doNotWatchPath))
         .evalMap { pMaybe =>
@@ -250,8 +246,8 @@ object LiveServer
 
       _ <- EmberServerBuilder
         .default[F]
-        .withHost(host)
-        .withPort(port)
+        .withHost(cli.host)
+        .withPort(cli.port)
         .withHttpWebSocketApp(wsb =>
           (new Websocket[F](wsb, wsOut).routes <+> app).orNotFound
         )
@@ -259,7 +255,7 @@ object LiveServer
         .evalTap { _ =>
           C.println(
             s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
-              |http://$host:$port${AnsiColor.RESET}""".stripMargin
+              |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
           ) *> C.println(
             s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}""".stripMargin
           )
@@ -279,19 +275,32 @@ object LiveServer
         )
         rg <- Random.scalaUtilRandom[F]
         // TODO: naive approach stack might overflow
-        newPort <- rg.betweenInt(0, 1023)
+        newPortMaybe <- rg.betweenInt(0, 1023).map(Port.fromInt)
+        newPort <- F.fromOption(
+          newPortMaybe,
+          new IllegalArgumentException("Bad port")
+        )
         server <- runServer(cli.withPort(newPort))
       } yield server
     }
 
   override def main: Opts[IO[ExitCode]] = {
 
-    val host = Opts.option[String]("host", "Host").withDefault("127.0.0.1")
+    val host = Opts
+      .option[String]("host", "Host")
+      .withDefault("127.0.0.1")
+      .mapValidated(host => Host.fromString(host).toValidNel("Invalid host"))
 
-    val port = Opts.option[Int]("port", "Port").withDefault(8080)
+    val port = Opts
+      .option[Int]("port", "Port")
+      .withDefault(8080)
+      .mapValidated(port => Port.fromInt(port).toValidNel("Invalid port"))
 
     val wait0 =
-      Opts.option[Int]("wait", "Wait before reload (ms)").withDefault(1000)
+      Opts
+        .option[Int]("wait", "Wait before reload (ms)")
+        .withDefault(1000)
+        .map(_.milliseconds)
 
     val entryFile = Opts
       .option[String]("entry-file", "Index html to be served as entry file")
@@ -305,7 +314,7 @@ object LiveServer
 
     val watch = Opts
       .options[String]("watch", "List of paths to watch")
-      .map(_.toList)
+      .map(_.toList.map(p => Fs2Path(p)))
       .orNone
 
     val proxy = Opts
