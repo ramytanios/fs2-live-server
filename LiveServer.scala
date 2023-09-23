@@ -55,7 +55,7 @@ object LiveServer
       entryFile: Fs2Path,
       ignore: Option[List[String]],
       watch: Option[List[Fs2Path]],
-      proxy: Option[String],
+      proxy: Option[(UriPath.Segment, Uri)],
       cors: Boolean,
       verbose: Boolean
   ) {
@@ -127,26 +127,21 @@ object LiveServer
   object ProxyMiddleware {
     def default[F[_]: LoggerFactory](
         httpApp: HttpRoutes[F],
-        path: String,
-        url: String,
+        path: UriPath.Segment,
+        uri: Uri,
         client: Client[F]
-    )(using F: Async[F]): HttpRoutes[F] = {
-      val newUriMaybe = Uri.fromString(url)
+    )(using F: Async[F]): HttpRoutes[F] =
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
-              if path0.segments.headOption.exists(_ == UriPath.Segment(path)) =>
-            cats.data.OptionT.liftF(
-              F.fromEither(newUriMaybe)
-                .flatMap(uri => {
-                  val newReq = req.withUri(uri.withPath(path0))
-                  client.stream(newReq).compile.lastOrError
-                })
-            )
+              if path0.segments.headOption.exists(_ == path) =>
+            cats.data.OptionT.liftF({
+              val newReq = req.withUri(uri.withPath(path0))
+              client.stream(newReq).compile.lastOrError
+            })
           case _ => httpApp(req)
         }
       }
-    }
   }
 
   def runServerImpl[F[_]: Files: Network](
@@ -218,19 +213,11 @@ object LiveServer
             if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
             else F.pure(sf)
           // proxy middleware
-          app1 <- cli.proxy.fold(F.pure(app0))(proxy =>
-            F.fromOption(
-              for {
-                path <- proxy.split(":").headOption
-                url <- proxy.split(":").tail.mkString(":").some
-              } yield (path, url),
-              new RuntimeException("Bad proxy settings")
-            ).flatMap { case (path, url) =>
-              EmberClientBuilder.default[F].build.use { client =>
-                F.delay(ProxyMiddleware.default(app0, path, url, client))
-              }
+          app1 <- cli.proxy.fold(F.pure(app0)) { case (path, url) =>
+            EmberClientBuilder.default[F].build.use { client =>
+              F.delay(ProxyMiddleware.default(app0, path, url, client))
             }
-          )
+          }
           // logging middleware
           app2 =
             if (cli.verbose) {
@@ -318,8 +305,23 @@ object LiveServer
       .orNone
 
     val proxy = Opts
-      .option[String]("proxy", "Proxy routes to URL, format ROUTE:URL")
+      .option[String]("proxy", "Path:URL proxy")
+      .mapValidated(proxy => {
+        val sp = proxy.split(":")
+        (
+          sp.headOption.map(UriPath.Segment),
+          Uri.fromString(sp.tail.mkString(":")).toOption
+        ).tupled.toValidNel("Bad proxy settings")
+      })
       .orNone
+
+    val proxyTargetUrl =
+      Opts
+        .option[String]("proxy-target-url", "Proxy target URL")
+        .mapValidated(url =>
+          Uri.fromString(url).leftMap(_.sanitized).toValidatedNel
+        )
+        .orNone
 
     val cors =
       Opts.flag("cors", "Allow any origin requests").orFalse
@@ -328,7 +330,17 @@ object LiveServer
       Opts.flag("verbose", "Logs all requests and responses", "V").orFalse
 
     val cli =
-      (host, port, wait0, entryFile, ignore, watch, proxy, cors, verbose).mapN(
+      (
+        host,
+        port,
+        wait0,
+        entryFile,
+        ignore,
+        watch,
+        proxy,
+        cors,
+        verbose
+      ).mapN(
         Cli.apply
       )
 
