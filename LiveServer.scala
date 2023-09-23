@@ -204,7 +204,7 @@ object LiveServer
         .evalMap { pMaybe =>
           wsOut.offer("reload") *>
             C.println(
-              s"""->>${AnsiColor.CYAN}Changes detected ${pMaybe
+              s"""${AnsiColor.CYAN}Changes detected ${pMaybe
                   .map(p => s"at `$p`")
                   .getOrElse("")}${AnsiColor.RESET}"""
             )
@@ -219,24 +219,22 @@ object LiveServer
         for {
           // CORS middleware
           app0 <-
-            if (cli.cors) {
-              middleware.CORS.policy.withAllowOriginAll(sf)
-            } else F.pure(sf)
+            if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
+            else F.pure(sf)
           // proxy middleware
-          app1 <- cli.proxy
-            .fold(F.pure(app0))(proxy =>
-              F.fromOption(
-                for {
-                  path <- proxy.split(":").headOption
-                  url <- proxy.split(":").tail.mkString(":").some
-                } yield (path, url),
-                new RuntimeException("Bad proxy settings")
-              ).flatMap { case (path, url) =>
-                EmberClientBuilder.default[F].build.use { client =>
-                  F.delay(ProxyMiddleware.default(app0, path, url, client))
-                }
+          app1 <- cli.proxy.fold(F.pure(app0))(proxy =>
+            F.fromOption(
+              for {
+                path <- proxy.split(":").headOption
+                url <- proxy.split(":").tail.mkString(":").some
+              } yield (path, url),
+              new RuntimeException("Bad proxy settings")
+            ).flatMap { case (path, url) =>
+              EmberClientBuilder.default[F].build.use { client =>
+                F.delay(ProxyMiddleware.default(app0, path, url, client))
               }
-            )
+            }
+          )
           // logging middleware
           app2 =
             if (cli.verbose) {
@@ -260,10 +258,10 @@ object LiveServer
         .build
         .evalTap { _ =>
           C.println(
-            s"""|${AnsiColor.MAGENTA}->>Live server of $cwd started at: 
+            s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
               |http://$host:$port${AnsiColor.RESET}""".stripMargin
           ) *> C.println(
-            s"""${AnsiColor.RED}->>Ready to watch changes${AnsiColor.RESET}""".stripMargin
+            s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}""".stripMargin
           )
         }
         .use(_ => F.never[Unit])
@@ -280,7 +278,7 @@ object LiveServer
           s"Port ${cli.port} already in use. Trying other ports .."
         )
         rg <- Random.scalaUtilRandom[F]
-        // TODO: naive approach stack might overflow 
+        // TODO: naive approach stack might overflow
         newPort <- rg.betweenInt(0, 1023)
         server <- runServer(cli.withPort(newPort))
       } yield server
