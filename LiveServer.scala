@@ -39,6 +39,8 @@ import java.net.http.HttpClient
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.Uri.{Path => UriPath}
+import java.net.BindException
+import cats.effect.std.Random
 
 object LiveServer
     extends CommandIOApp(
@@ -56,10 +58,12 @@ object LiveServer
       proxy: Option[String],
       cors: Boolean,
       verbose: Boolean
-  )
+  ) {
+    def withPort(port: Int) = this.copy(port = port)
+  }
 
   // websocket connection
-  final class Websocket[F[_]](ws: WebSocketBuilder2[F], sq: Queue[F, String])(
+  final class Websocket[F[_]](wsb: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
   ) extends Http4sDsl[F] {
     val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root / "ws" =>
@@ -67,9 +71,11 @@ object LiveServer
         fs2.Stream
           .fromQueueUnterminated(sq)
           .map(message => WebSocketFrame.Text(message))
+
       val receive: fs2.Pipe[F, WebSocketFrame, Unit] =
         is => is.evalMap { _ => F.unit }
-      ws.build(send, receive)
+
+      wsb.build(send, receive)
     }
   }
 
@@ -88,9 +94,12 @@ object LiveServer
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    val injectedPath = Fs2Path("injected.html")
+    private val injectedPath = Fs2Path("injected.html")
 
-    private val static: HttpRoutes[F] = HttpRoutes.of[F] {
+    private def readFile(path: Fs2Path): F[String] =
+      Files[F].readUtf8(path).compile.lastOrError
+
+    val routes: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root / fileName =>
         StaticFile
           .fromPath[F](Fs2Path(fileName))
@@ -98,8 +107,8 @@ object LiveServer
 
       case GET -> Root =>
         for {
-          index <- Files[F].readUtf8(entryFile).compile.lastOrError
-          script <- Files[F].readUtf8(injectedPath).compile.lastOrError
+          index <- readFile(entryFile)
+          script <- readFile(injectedPath)
           index0 <- F.fromOption(
             ScriptInjector(index, script),
             new RuntimeException("Failed to serve index.html")
@@ -111,10 +120,7 @@ object LiveServer
         } yield Response()
           .withEntity(index0)
           .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
-
     }
-
-    val routes = static
   }
 
   // proxy middleware
@@ -143,26 +149,24 @@ object LiveServer
     }
   }
 
-  def server[F[_]: Files: Network](
+  def runServerImpl[F[_]: Files: Network](
       cli: Cli
-  )(using F: Async[F], C: Console[F]): Resource[F, Server] = {
+  )(using F: Async[F], C: Console[F]): F[Unit] = {
     implicit val loggerFactory: LoggerFactory[F] = Slf4jFactory.create[F]
     for {
-      host <-
-        F.fromOption(
-          Host.fromString(cli.host),
-          new IllegalArgumentException("Invalid host")
-        ).toResource
+      host <- F.fromOption(
+        Host.fromString(cli.host),
+        new IllegalArgumentException("Invalid host")
+      )
 
-      port <-
-        F.fromOption(
-          Port.fromInt(cli.port),
-          new IllegalArgumentException("Invalid port")
-        ).toResource
+      port <- F.fromOption(
+        Port.fromInt(cli.port),
+        new IllegalArgumentException("Invalid port")
+      )
 
-      logger <- loggerFactory.create.toResource
+      logger <- loggerFactory.create
 
-      wsOut <- cats.effect.std.Queue.unbounded[F, String].toResource
+      wsOut <- Queue.unbounded[F, String]
 
       doNotWatchPath = (p: Fs2Path) =>
         F.pure {
@@ -173,8 +177,8 @@ object LiveServer
             .reduce(_ || _)
         }
 
-      pathFromEvent = (e: Event) =>
-        e match {
+      pathFromEvent = (ev: Event) =>
+        ev match {
           case Event.Created(p, _)     => p.some
           case Event.Deleted(p, _)     => p.some
           case Event.Modified(p, _)    => p.some
@@ -182,15 +186,15 @@ object LiveServer
           case Event.NonStandard(_, p) => p.some
         }
 
-      eventQ <- cats.effect.std.Queue.unbounded[F, Event].toResource
+      eventQ <- Queue.unbounded[F, Event]
 
-      cwd <- Files[F].currentWorkingDirectory.toResource
+      cwd <- Files[F].currentWorkingDirectory
 
       _ <- cli.watch
         .fold(cwd :: Nil)(_.map(p => Fs2Path(p)))
         .map(p => Files[F].watch(p).evalMap(eventQ.offer).compile.drain)
         .parSequence
-        .background
+        .start
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
@@ -208,7 +212,7 @@ object LiveServer
         }
         .compile
         .drain
-        .background
+        .start
 
       app <- {
         val sf = new StaticFileServer[F](cli.entryFile).routes
@@ -244,10 +248,9 @@ object LiveServer
             } else app1
 
         } yield app2
-      }.toResource
+      }
 
-      // TODO: add retry logic on failing port
-      server <- EmberServerBuilder
+      _ <- EmberServerBuilder
         .default[F]
         .withHost(host)
         .withPort(port)
@@ -263,9 +266,25 @@ object LiveServer
             s"""${AnsiColor.RED}->>Ready to watch changes${AnsiColor.RESET}""".stripMargin
           )
         }
+        .use(_ => F.never[Unit])
 
-    } yield server
+    } yield ()
   }
+
+  def runServer[F[_]: Files: Network](
+      cli: Cli
+  )(using F: Async[F], C: Console[F]): F[Unit] =
+    runServerImpl(cli).handleErrorWith { case th: BindException =>
+      for {
+        _ <- C.println(
+          s"Port ${cli.port} already in use. Trying other ports .."
+        )
+        rg <- Random.scalaUtilRandom[F]
+        // TODO: improve stack might overflow
+        newPort <- rg.betweenInt(0, 1023)
+        server <- runServer(cli.withPort(newPort))
+      } yield server
+    }
 
   override def main: Opts[IO[ExitCode]] = {
 
@@ -306,10 +325,7 @@ object LiveServer
         Cli.apply
       )
 
-    val app = cli.map(cl =>
-      server[IO](cl).use(_ => IO.never[Unit]).as(ExitCode.Success)
-    )
-
+    val app = cli.map(cl => runServer[IO](cl).as(ExitCode.Success))
     app
 
   }
