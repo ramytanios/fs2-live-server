@@ -2,12 +2,18 @@
 
 Scala rewrite of [Live Server](https://github.com/tapio/live-server) 
 
+Build the app:
 ```bash
-# build 
 scala-cli --power package LiveServer.scala -f -o ls
-# run live server
+```
+Run the server:
+```bash
 ./ls --entry-file=index.html --watch ./index.html --proxy api:http://localhost:8090 --verbose
-# run mock server 
-pip3 install uvicorn fastapi
+```
+
+Run mock server (`pip install uvicorn fastapi`)
+```bash
 uvicorn mock-server:app
 ```
+
+
