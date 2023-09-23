@@ -280,7 +280,7 @@ object LiveServer
           s"Port ${cli.port} already in use. Trying other ports .."
         )
         rg <- Random.scalaUtilRandom[F]
-        // TODO: improve stack might overflow
+        // TODO: naive approach stack might overflow 
         newPort <- rg.betweenInt(0, 1023)
         server <- runServer(cli.withPort(newPort))
       } yield server
