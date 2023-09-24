@@ -21,7 +21,6 @@ import org.typelevel.log4cats.slf4j.Slf4jFactory
 import cats.effect.IO
 import org.http4s.*
 import org.http4s.dsl.*
-import org.http4s.dsl.impl.Responses.NotFoundOps
 import cats.effect.std.Console
 import scala.io.AnsiColor
 import scala.concurrent.duration.*
