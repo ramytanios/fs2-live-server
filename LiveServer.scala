@@ -261,7 +261,6 @@ object LiveServer
           Attempt to find other port ..${AnsiColor.RESET}"""
         )
         rg <- Random.scalaUtilRandom[F]
-        // TODO: naive approach stack might overflow
         newPortMaybe <- rg.betweenInt(1024, 65535).map(Port.fromInt)
         newPort <- F.fromOption(
           newPortMaybe,
