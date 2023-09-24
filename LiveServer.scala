@@ -244,7 +244,7 @@ object LiveServer
             s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
               |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
           ) *> C.println(
-            s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}""".stripMargin
+            s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
           )
         }
         .use(_ => F.never[Unit])
@@ -314,14 +314,6 @@ object LiveServer
         ).tupled.toValidNel("Bad proxy settings")
       })
       .orNone
-
-    val proxyTargetUrl =
-      Opts
-        .option[String]("proxy-target-url", "Proxy target URL")
-        .mapValidated(url =>
-          Uri.fromString(url).leftMap(_.sanitized).toValidatedNel
-        )
-        .orNone
 
     val cors =
       Opts.flag("cors", "Allow any origin requests").orFalse
