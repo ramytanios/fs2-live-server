@@ -189,9 +189,9 @@ object LiveServer
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
-        .debounce(cli.wait0)
         .map(pathFromEvent)
         .evalFilterNot(_.existsM(doNotWatchPath))
+        .debounce(cli.wait0)
         .evalMap { pMaybe =>
           wsOut.offer("reload") *>
             C.println(
