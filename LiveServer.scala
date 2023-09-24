@@ -193,12 +193,11 @@ object LiveServer
         .evalFilterNot(_.existsM(doNotWatchPath))
         .debounce(cli.wait0)
         .evalMap { pMaybe =>
-          wsOut.offer("reload") *>
-            C.println(
-              s"""${AnsiColor.CYAN}Changes detected ${pMaybe
-                  .map(p => s"at `$p`")
-                  .getOrElse("")}${AnsiColor.RESET}"""
-            )
+          wsOut.offer("reload") *> C.println(
+            s"""${AnsiColor.CYAN}Changes detected ${pMaybe
+                .map(p => s"at `$p`")
+                .getOrElse("")}${AnsiColor.RESET}"""
+          )
 
         }
         .compile
@@ -262,7 +261,7 @@ object LiveServer
         )
         rg <- Random.scalaUtilRandom[F]
         // TODO: naive approach stack might overflow
-        newPortMaybe <- rg.betweenInt(0, 1023).map(Port.fromInt)
+        newPortMaybe <- rg.betweenInt(1024, 65535).map(Port.fromInt)
         newPort <- F.fromOption(
           newPortMaybe,
           new IllegalArgumentException("Bad port")
@@ -316,7 +315,6 @@ object LiveServer
       .orNone
 
     val cors =
-
       Opts.flag("cors", "Allow any origin requests").orFalse
 
     val verbose =
