@@ -257,7 +257,8 @@ object LiveServer
     runServerImpl(cli).handleErrorWith { case th: BindException =>
       for {
         _ <- C.println(
-          s"Port ${cli.port} already in use. Trying other ports .."
+          s"""${AnsiColor.RED}Failed to start server. Perhaps port ${cli.port} already in use.
+          Attempt to find other port ..${AnsiColor.RESET}"""
         )
         rg <- Random.scalaUtilRandom[F]
         // TODO: naive approach stack might overflow
