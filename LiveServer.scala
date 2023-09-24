@@ -316,6 +316,7 @@ object LiveServer
       .orNone
 
     val cors =
+
       Opts.flag("cors", "Allow any origin requests").orFalse
 
     val verbose =
