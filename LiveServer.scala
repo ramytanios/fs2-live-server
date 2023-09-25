@@ -1,11 +1,6 @@
-//> using toolkit typelevel:latest
-//> using dep org.http4s::http4s-ember-server:1.0.0-M40
-//> using dep org.http4s::http4s-ember-client:1.0.0-M40
-//> using dep org.http4s::http4s-dsl:1.0.0-M40
-//> using dep com.monovore::decline-effect:2.4.1
-//> using dep ch.qos.logback:logback-classic:1.4.11
-
-import cats.effect.kernel.*
+import cats.effect.kernel.Async
+import cats.effect.kernel.Resource
+import cats.effect.kernel.Concurrent
 import fs2.io.file.Files
 import org.http4s.server.websocket.WebSocketBuilder2
 import cats.effect.std.Queue
@@ -15,9 +10,7 @@ import com.comcast.ip4s.*
 import org.http4s.ember.server.EmberServerBuilder
 import fs2.io.file.{Path => Fs2Path}
 import cats.syntax.all.*
-import org.typelevel.log4cats.LoggerFactory
 import org.http4s.dsl.io.*
-import org.typelevel.log4cats.slf4j.Slf4jFactory
 import cats.effect.IO
 import org.http4s.*
 import org.http4s.dsl.*
@@ -34,11 +27,9 @@ import fs2.io.net.Network
 import org.typelevel.ci.CIString
 import org.http4s.headers.`Content-Type`
 import cats.data.Kleisli
-import java.net.http.HttpClient
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.Uri.{Path => UriPath}
-import java.net.BindException
 import cats.effect.std.Random
 
 object LiveServer
@@ -88,7 +79,7 @@ object LiveServer
   }
 
   // static file server
-  final class StaticFileServer[F[_]: Files: LoggerFactory](
+  final class StaticFileServer[F[_]: Files](
       entryFile: Fs2Path
   )(using F: Concurrent[F], C: Console[F])
       extends Http4sDsl[F] {
@@ -99,11 +90,6 @@ object LiveServer
       Files[F].readUtf8(path).compile.lastOrError
 
     val routes: HttpRoutes[F] = HttpRoutes.of[F] {
-      case GET -> Root / fileName =>
-        StaticFile
-          .fromPath[F](Fs2Path(fileName))
-          .getOrElseF(NotFound())
-
       case GET -> Root =>
         for {
           index <- readFileF(entryFile)
@@ -116,15 +102,20 @@ object LiveServer
             MediaType.forExtension("html"),
             new RuntimeException("Invalid media type")
           )
-        } yield Response()
+        } yield Response[F]()
           .withEntity(index0)
           .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
+
+      case GET -> Root / fileName =>
+        StaticFile
+          .fromPath[F](Fs2Path(fileName))
+          .getOrElseF(NotFound())
     }
   }
 
   // proxy middleware
   object ProxyMiddleware {
-    def default[F[_]: LoggerFactory](
+    def default[F[_]](
         httpApp: HttpRoutes[F],
         path: UriPath.Segment,
         uri: Uri,
@@ -145,10 +136,8 @@ object LiveServer
 
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
-  )(using F: Async[F], C: Console[F]): F[Unit] = {
-    implicit val loggerFactory: LoggerFactory[F] = Slf4jFactory.create[F]
+  )(using F: Async[F], C: Console[F]): F[Unit] = 
     for {
-      logger <- loggerFactory.create
 
       cwd <- Files[F].currentWorkingDirectory
 
@@ -206,23 +195,23 @@ object LiveServer
       app <- {
         val sf = new StaticFileServer[F](cli.entryFile).routes
         for {
-          // CORS middleware
-          app0 <-
-            if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
-            else F.pure(sf)
           // proxy middleware
-          app1 <- cli.proxy.fold(F.pure(app0)) { case (path, url) =>
+          app0 <- cli.proxy.fold(F.pure(sf)) { case (path, url) =>
             EmberClientBuilder.default[F].build.use { client =>
-              F.delay(ProxyMiddleware.default(app0, path, url, client))
+              F.delay(ProxyMiddleware.default(sf, path, url, client))
             }
           }
+          // CORS middleware
+          app1 =
+            if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
+            else app0
           // logging middleware
           app2 =
             if (cli.verbose) {
               middleware.Logger.httpRoutes[F](
                 logHeaders = true,
                 logBody = true,
-                logAction = ((msg: String) => logger.info(msg)).some
+                logAction = ((msg: String) => C.println(msg)).some
               )(app1)
             } else app1
 
@@ -248,12 +237,11 @@ object LiveServer
         .use(_ => F.never[Unit])
 
     } yield ()
-  }
 
   def runServer[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    runServerImpl(cli).handleErrorWith { case th: BindException =>
+    runServerImpl(cli).handleErrorWith { case th =>
       for {
         _ <- C.println(
           s"""${AnsiColor.RED}Failed to start server. Perhaps port ${cli.port} already in use.
