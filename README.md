@@ -22,4 +22,7 @@ scala-cli --power package project.scala MockServer.scala -f -o ms
 ./ms
 ```
 
-
+TODO: 
+1. favicon.ico seems not to work properly (problem with routes)
+2. open browser automatically on server startup
+3. Better logging 
