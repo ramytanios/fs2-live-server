@@ -1,7 +1,10 @@
-import cats.effect._
-import fs2.io.file.Files
-import org.http4s.server.websocket.WebSocketBuilder2
+import cats.effect.*
+import cats.effect.implicits.*
 import cats.effect.std.Queue
+import cats.effect.std.Console
+import cats.effect.std.Random
+import org.http4s.server.websocket.WebSocketBuilder2
+import fs2.io.file.Files
 import org.http4s.websocket.WebSocketFrame
 import org.http4s.server.middleware
 import com.comcast.ip4s.*
@@ -9,18 +12,14 @@ import org.http4s.ember.server.EmberServerBuilder
 import fs2.io.file.{Path => Fs2Path}
 import cats.syntax.all.*
 import org.http4s.dsl.io.*
-import cats.effect.IO
 import org.http4s.*
 import org.http4s.dsl.*
-import cats.effect.std.Console
 import scala.io.AnsiColor
 import scala.concurrent.duration.*
-import cats.effect.implicits.*
 import org.http4s.server.Server
 import fs2.io.file.Watcher.Event
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
-import cats.effect.ExitCode
 import fs2.io.net.Network
 import org.typelevel.ci.CIString
 import org.http4s.headers.`Content-Type`
@@ -28,9 +27,9 @@ import cats.data.Kleisli
 import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.Uri.{Path => UriPath}
-import cats.effect.std.Random
 import cats.data.OptionT
 import cats.data.NonEmptyList
+import java.net.BindException
 
 object LiveServer
     extends CommandIOApp(
@@ -120,12 +119,12 @@ object LiveServer
   }
 
   object ProxyMiddleware {
-    def default[F[_]](
-        httpRoutes: HttpRoutes[F],
+
+    def apply[F[_]](
         path: UriPath.Segment,
         uri: Uri,
         client: Client[F]
-    )(using F: Concurrent[F]): HttpRoutes[F] =
+    )(httpRoutes: HttpRoutes[F])(using F: Concurrent[F]): HttpRoutes[F] =
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
@@ -136,6 +135,7 @@ object LiveServer
           case _ => httpRoutes(req)
         }
       }
+
   }
 
   def pathFromEvent(ev: Event): Option[Fs2Path] =
@@ -188,35 +188,29 @@ object LiveServer
         .drain
         .background
 
-      app <- {
-        val sf = new StaticFileServer[F](cli.entryFile).routes
-        cli.proxy
-          .fold(Resource.pure(sf)) { case (path, url) =>
-            // proxy middleware requires an HTTP client
+      app <- Resource
+        .pure(new StaticFileServer[F](cli.entryFile).routes)
+        .flatMap(app0 =>
+          cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
             EmberClientBuilder
               .default[F]
               .build
-              .map(client => ProxyMiddleware.default(sf, path, url, client))
+              .map(client => ProxyMiddleware(path, url, client)(app0))
           }
-          .map { app0 =>
-            // CORS middleware
-            val app1 =
-              if (cli.cors) middleware.CORS.policy.withAllowOriginAll(app0)
-              else app0
-
-            // logging middleware
-            val app2 =
-              if (cli.verbose) {
-                middleware.Logger.httpRoutes[F](
-                  logHeaders = true,
-                  logBody = true,
-                  logAction = ((msg: String) => C.println(msg)).some
-                )(app1)
-              } else app1
-
-            app2
-          }
-      }
+        )
+        .map(app0 =>
+          if (cli.cors) middleware.CORS.policy.withAllowOriginAll(app0)
+          else app0
+        )
+        .map(app0 =>
+          if (cli.verbose) {
+            middleware.Logger.httpRoutes[F](
+              logHeaders = true,
+              logBody = true,
+              logAction = ((msg: String) => C.println(msg)).some
+            )(app0)
+          } else app0
+        )
 
       server <- EmberServerBuilder
         .default[F]
@@ -240,21 +234,20 @@ object LiveServer
   def runServer[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    runServerImpl(cli).handleErrorWith { case t =>
+    runServerImpl(cli).recoverWith { case ex: java.net.BindException =>
       for {
-        _ <- C.errorln(t.toString)
+        _ <- C.errorln(ex.toString)
         _ <- C.println(
-          s"""${AnsiColor.RED}Failed to start server. Perhaps port ${cli.port} already in use.
+          s"""${AnsiColor.RED}Failed to start server.
+          Perhaps port ${cli.port} is already in use.
           Attempt to find other port ..${AnsiColor.RESET}"""
         )
         rg <- Random.scalaUtilRandom[F]
-        newPortMaybe <- rg.betweenInt(1024, 65535).map(Port.fromInt)
-        newPort <- F.fromOption(
-          newPortMaybe,
-          new IllegalArgumentException("Bad port")
-        )
-        server <- runServer(cli.withPort(newPort))
-      } yield server
+        newPort <- rg
+          .betweenInt(1024, 65535)
+          .map(Port.fromInt(_).get) // `get` is safe here
+        _ <- runServer(cli.withPort(newPort))
+      } yield ()
     }
 
   override def main: Opts[IO[ExitCode]] = {
