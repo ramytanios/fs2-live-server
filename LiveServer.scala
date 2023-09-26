@@ -1,6 +1,4 @@
-import cats.effect.kernel.Async
-import cats.effect.kernel.Resource
-import cats.effect.kernel.Concurrent
+import cats.effect._
 import fs2.io.file.Files
 import org.http4s.server.websocket.WebSocketBuilder2
 import cats.effect.std.Queue
@@ -31,6 +29,8 @@ import org.http4s.client.Client
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.Uri.{Path => UriPath}
 import cats.effect.std.Random
+import cats.data.OptionT
+import cats.data.NonEmptyList
 
 object LiveServer
     extends CommandIOApp(
@@ -43,13 +43,19 @@ object LiveServer
       port: Port,
       wait0: FiniteDuration,
       entryFile: Fs2Path,
-      ignore: Option[List[String]],
+      ignore: Option[NonEmptyList[String]],
       watch: Option[List[Fs2Path]],
       proxy: Option[(UriPath.Segment, Uri)],
       cors: Boolean,
       verbose: Boolean
   ) {
     def withPort(port: Port) = this.copy(port = port)
+
+    def ignorePath(p: Fs2Path): Boolean =
+      this.ignore
+        .fold(false :: Nil)(_.toList.map(_.r.findFirstIn(p.toString).isDefined))
+        .reduce(_ || _)
+
   }
 
   // websocket connection
@@ -113,112 +119,106 @@ object LiveServer
     }
   }
 
-  // proxy middleware
   object ProxyMiddleware {
     def default[F[_]](
-        httpApp: HttpRoutes[F],
+        httpRoutes: HttpRoutes[F],
         path: UriPath.Segment,
         uri: Uri,
         client: Client[F]
-    )(using F: Async[F]): HttpRoutes[F] =
+    )(using F: Concurrent[F]): HttpRoutes[F] =
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
               if path0.segments.headOption.exists(_ == path) =>
-            cats.data.OptionT.liftF({
-              val newReq = req.withUri(uri.withPath(path0))
-              client.stream(newReq).compile.lastOrError
-            })
-          case _ => httpApp(req)
+            OptionT(
+              client.stream(req.withUri(uri.withPath(path0))).compile.last
+            )
+          case _ => httpRoutes(req)
         }
       }
   }
 
+  def pathFromEvent(ev: Event): Option[Fs2Path] =
+    ev match {
+      case Event.Created(p, _)     => p.some
+      case Event.Deleted(p, _)     => p.some
+      case Event.Modified(p, _)    => p.some
+      case Event.Overflow(_)       => None
+      case Event.NonStandard(_, p) => p.some
+    }
+
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
-  )(using F: Async[F], C: Console[F]): F[Unit] = 
-    for {
+  )(using F: Async[F], C: Console[F]): F[Unit] =
+    (for {
+      killSwitch <- F.deferred[Unit].toResource
+      flipKillSwitch = killSwitch.complete(()).void
 
-      cwd <- Files[F].currentWorkingDirectory
+      cwd <- Files[F].currentWorkingDirectory.toResource
 
-      eventQ <- Queue.unbounded[F, Event]
+      eventQ <- Queue.unbounded[F, Event].toResource
 
-      wsOut <- Queue.unbounded[F, String]
-
-      doNotWatchPath = (p: Fs2Path) =>
-        F.pure {
-          cli.ignore
-            .fold(false :: Nil)(rgxs =>
-              rgxs.map(rgx => rgx.r.findFirstIn(p.toString).isDefined)
-            )
-            .reduce(_ || _)
-        }
-
-      pathFromEvent = (ev: Event) =>
-        ev match {
-          case Event.Created(p, _)     => p.some
-          case Event.Deleted(p, _)     => p.some
-          case Event.Modified(p, _)    => p.some
-          case Event.Overflow(_)       => None
-          case Event.NonStandard(_, p) => p.some
-        }
+      wsOut <- Queue.unbounded[F, String].toResource
 
       _ <- cli.watch
         .getOrElse(cwd :: Nil)
-        .map(path =>
+        .parTraverse(
           Files[F]
-            .watch(path)
+            .watch(_)
             .evalMap(eventQ.offer)
             .compile
             .drain
         )
-        .parSequence
-        .start
+        .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
+        .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
         .map(pathFromEvent)
-        .evalFilterNot(_.existsM(doNotWatchPath))
+        .filterNot(_.fold(false)(cli.ignorePath))
         .debounce(cli.wait0)
-        .evalMap { pMaybe =>
+        .evalMap(pMaybe =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected ${pMaybe
-                .map(p => s"at `$p`")
-                .getOrElse("")}${AnsiColor.RESET}"""
+            s"""${AnsiColor.CYAN}Changes detected ${pMaybe.fold("")(p =>
+                s"in `$p`"
+              )}${AnsiColor.RESET}"""
           )
-
-        }
+        )
         .compile
         .drain
-        .start
+        .background
 
       app <- {
         val sf = new StaticFileServer[F](cli.entryFile).routes
-        for {
-          // proxy middleware
-          app0 <- cli.proxy.fold(F.pure(sf)) { case (path, url) =>
-            EmberClientBuilder.default[F].build.use { client =>
-              F.delay(ProxyMiddleware.default(sf, path, url, client))
-            }
+        cli.proxy
+          .fold(Resource.pure(sf)) { case (path, url) =>
+            // proxy middleware requires an HTTP client
+            EmberClientBuilder
+              .default[F]
+              .build
+              .map(client => ProxyMiddleware.default(sf, path, url, client))
           }
-          // CORS middleware
-          app1 =
-            if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
-            else app0
-          // logging middleware
-          app2 =
-            if (cli.verbose) {
-              middleware.Logger.httpRoutes[F](
-                logHeaders = true,
-                logBody = true,
-                logAction = ((msg: String) => C.println(msg)).some
-              )(app1)
-            } else app1
+          .map { app0 =>
+            // CORS middleware
+            val app1 =
+              if (cli.cors) middleware.CORS.policy.withAllowOriginAll(app0)
+              else app0
 
-        } yield app2
+            // logging middleware
+            val app2 =
+              if (cli.verbose) {
+                middleware.Logger.httpRoutes[F](
+                  logHeaders = true,
+                  logBody = true,
+                  logAction = ((msg: String) => C.println(msg)).some
+                )(app1)
+              } else app1
+
+            app2
+          }
       }
 
-      _ <- EmberServerBuilder
+      server <- EmberServerBuilder
         .default[F]
         .withHost(cli.host)
         .withPort(cli.port)
@@ -234,15 +234,15 @@ object LiveServer
             s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
           )
         }
-        .use(_ => F.never[Unit])
 
-    } yield ()
+    } yield killSwitch.get).useEval
 
   def runServer[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    runServerImpl(cli).handleErrorWith { case th =>
+    runServerImpl(cli).handleErrorWith { case t =>
       for {
+        _ <- C.errorln(t.toString)
         _ <- C.println(
           s"""${AnsiColor.RED}Failed to start server. Perhaps port ${cli.port} already in use.
           Attempt to find other port ..${AnsiColor.RESET}"""
@@ -282,7 +282,6 @@ object LiveServer
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
-      .map(_.toList)
       .orNone
 
     val watch = Opts
@@ -318,12 +317,9 @@ object LiveServer
         proxy,
         cors,
         verbose
-      ).mapN(
-        Cli.apply
-      )
+      ).mapN(Cli.apply)
 
-    val app = cli.map(cl => runServer[IO](cl).as(ExitCode.Success))
-    app
+    cli.map(runServer[IO](_).as(ExitCode.Success))
 
   }
 }
