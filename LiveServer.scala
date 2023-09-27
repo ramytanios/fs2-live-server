@@ -149,6 +149,50 @@ object LiveServer
       case Event.NonStandard(_, p) => p.some
     }
 
+  trait PathWatcher[F[_]] {
+
+    /** path being watched */
+    def path: Fs2Path
+
+    /** stream of notifications */
+    def changes: fs2.Stream[F, Unit]
+  }
+
+  object PathWatcher {
+    def apply[F[_]: Temporal: Files](
+        p: Fs2Path,
+        watchEvery: FiniteDuration
+    ): Resource[F, PathWatcher[F]] =
+      for {
+
+        currentTimeModified <- Files[F].getLastModifiedTime(p).toResource
+
+        lastTimeModified <- fs2.concurrent
+          .SignallingRef[F]
+          .of(currentTimeModified)
+          .toResource
+
+        _ <- fs2.Stream
+          .fixedDelay[F](watchEvery)
+          .evalMap { _ =>
+            Files[F].getLastModifiedTime(p).flatMap { time =>
+              lastTimeModified.set(time)
+            }
+          }
+          .compile
+          .drain
+          .background
+
+      } yield new PathWatcher[F] {
+
+        override def path: Fs2Path = p
+
+        override def changes: fs2.Stream[F, Unit] =
+          lastTimeModified.changes.discrete.as(())
+      }
+
+  }
+
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
@@ -158,32 +202,28 @@ object LiveServer
 
       cwd <- Files[F].currentWorkingDirectory.toResource
 
-      eventQ <- Queue.unbounded[F, Event].toResource
+      eventQ <- Queue.unbounded[F, Unit].toResource
 
       wsOut <- Queue.unbounded[F, String].toResource
 
       _ <- cli.watch
         .getOrElse(cwd :: Nil)
-        .parTraverse(
-          Files[F]
-            .watch(_)
-            .evalMap(eventQ.offer)
-            .compile
-            .drain
+        .parTraverse(p =>
+          PathWatcher[F](p, 1.second).use { pw =>
+            pw.changes.evalMap(eventQ.offer).compile.drain
+          }
         )
         .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
         .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
-        .map(pathFromEvent)
-        .filterNot(_.fold(false)(cli.ignorePath))
+        // .map(pathFromEvent)
+        // .filterNot(_.fold(false)(cli.ignorePath))
         .debounce(cli.wait0)
         .evalMap(pMaybe =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected ${pMaybe.fold("")(p =>
-                s"in `$p`"
-              )}${AnsiColor.RESET}"""
+            s"""${AnsiColor.CYAN}Changes detected${AnsiColor.RESET}"""
           )
         )
         .compile
