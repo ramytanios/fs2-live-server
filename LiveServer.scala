@@ -1,36 +1,38 @@
-import cats.effect.kernel.Async
-import cats.effect.kernel.Resource
-import cats.effect.kernel.Concurrent
-import fs2.io.file.Files
-import org.http4s.server.websocket.WebSocketBuilder2
-import cats.effect.std.Queue
-import org.http4s.websocket.WebSocketFrame
-import org.http4s.server.middleware
-import com.comcast.ip4s.*
-import org.http4s.ember.server.EmberServerBuilder
-import fs2.io.file.{Path => Fs2Path}
-import cats.syntax.all.*
-import org.http4s.dsl.io.*
-import cats.effect.IO
-import org.http4s.*
-import org.http4s.dsl.*
-import cats.effect.std.Console
-import scala.io.AnsiColor
-import scala.concurrent.duration.*
+import cats.MonadThrow
+import cats.data.Kleisli
+import cats.data.NonEmptyList
+import cats.data.OptionT
+import cats.effect.*
 import cats.effect.implicits.*
-import org.http4s.server.Server
-import fs2.io.file.Watcher.Event
+import cats.effect.std.Console
+import cats.effect.std.Queue
+import cats.effect.std.Random
+import cats.syntax.all.*
+import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
-import cats.effect.ExitCode
+import fs2.io.file.Files
+import fs2.io.file.Watcher.Event
+import fs2.io.file.{Path => Fs2Path}
 import fs2.io.net.Network
-import org.typelevel.ci.CIString
-import org.http4s.headers.`Content-Type`
-import cats.data.Kleisli
-import org.http4s.client.Client
-import org.http4s.ember.client.EmberClientBuilder
+import mouse.all.*
 import org.http4s.Uri.{Path => UriPath}
-import cats.effect.std.Random
+import org.http4s.*
+import org.http4s.client.Client
+import org.http4s.dsl.*
+import org.http4s.dsl.io.*
+import org.http4s.ember.client.EmberClientBuilder
+import org.http4s.ember.server.EmberServerBuilder
+import org.http4s.headers.`Content-Type`
+import org.http4s.server.Server
+import org.http4s.server.middleware
+import org.http4s.server.websocket.WebSocketBuilder2
+import org.http4s.websocket.WebSocketFrame
+import org.typelevel.ci.CIString
+
+import java.net.BindException
+import scala.concurrent.duration.*
+import scala.io.AnsiColor
 
 object LiveServer
     extends CommandIOApp(
@@ -43,13 +45,19 @@ object LiveServer
       port: Port,
       wait0: FiniteDuration,
       entryFile: Fs2Path,
-      ignore: Option[List[String]],
+      ignore: Option[NonEmptyList[String]],
       watch: Option[List[Fs2Path]],
       proxy: Option[(UriPath.Segment, Uri)],
       cors: Boolean,
       verbose: Boolean
   ) {
     def withPort(port: Port) = this.copy(port = port)
+
+    def ignorePath(p: Fs2Path): Boolean =
+      this.ignore
+        .fold(false :: Nil)(_.toList.map(_.r.findFirstIn(p.toString).isDefined))
+        .reduce(_ || _)
+
   }
 
   // websocket connection
@@ -62,8 +70,7 @@ object LiveServer
           .fromQueueUnterminated(sq)
           .map(message => WebSocketFrame.Text(message))
 
-      val receive: fs2.Pipe[F, WebSocketFrame, Unit] =
-        is => is.evalMap { _ => F.unit }
+      val receive: fs2.Pipe[F, WebSocketFrame, Unit] = _.drain
 
       wsb.build(send, receive)
     }
@@ -80,145 +87,147 @@ object LiveServer
 
   // static file server
   final class StaticFileServer[F[_]: Files](
-      entryFile: Fs2Path
-  )(using F: Concurrent[F], C: Console[F])
+      indexHtml: String
+  )(using F: Async[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    private val injectedPath = Fs2Path("injected.html")
-
     private def readFileF(path: Fs2Path): F[String] =
-      Files[F].readUtf8(path).compile.lastOrError
+      Files[F].readUtf8(path).compile.onlyOrError
 
     val routes: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root =>
-        for {
-          index <- readFileF(entryFile)
-          script <- readFileF(injectedPath)
-          index0 <- F.fromOption(
-            ScriptInjector(index, script),
-            new RuntimeException("Failed to serve index.html")
-          )
-          mediaType <- F.fromOption(
-            MediaType.forExtension("html"),
-            new RuntimeException("Invalid media type")
-          )
-        } yield Response[F]()
-          .withEntity(index0)
-          .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
+        Response[F]()
+          .withEntity(indexHtml)
+          .withContentType(`Content-Type`(MediaType.text.html, Charset.`UTF-8`))
+          .pure[F]
 
-      case GET -> Root / fileName =>
+      case GET -> path =>
         StaticFile
-          .fromPath[F](Fs2Path(fileName))
+          .fromPath[F](Fs2Path(s".${path.toString}"))
           .getOrElseF(NotFound())
     }
   }
 
-  // proxy middleware
+  object ErrorLoggingMiddleware {
+
+    def apply[F[_]: MonadThrow: Console](routes: HttpRoutes[F]): HttpRoutes[F] =
+      org.http4s.server.middleware.ErrorAction.httpRoutes
+        .log(
+          routes,
+          (t, msg) => Console[F].errorln(s"$msg: $t"),
+          (t, msg) => Console[F].errorln(s"$msg: $t")
+        )
+
+  }
+
   object ProxyMiddleware {
-    def default[F[_]](
-        httpApp: HttpRoutes[F],
+
+    def apply[F[_]](
         path: UriPath.Segment,
         uri: Uri,
         client: Client[F]
-    )(using F: Async[F]): HttpRoutes[F] =
+    )(httpRoutes: HttpRoutes[F])(using F: Concurrent[F]): HttpRoutes[F] =
       Kleisli { req =>
         req.uri match {
           case Uri(_, _, path0, _, _)
               if path0.segments.headOption.exists(_ == path) =>
-            cats.data.OptionT.liftF({
-              val newReq = req.withUri(uri.withPath(path0))
-              client.stream(newReq).compile.lastOrError
-            })
-          case _ => httpApp(req)
+            OptionT(
+              client.stream(req.withUri(uri.withPath(path0))).compile.last
+            )
+          case _ => httpRoutes(req)
         }
       }
+
   }
+
+  def pathFromEvent(ev: Event): Option[Fs2Path] =
+    ev match {
+      case Event.Created(p, _)     => p.some
+      case Event.Deleted(p, _)     => p.some
+      case Event.Modified(p, _)    => p.some
+      case Event.Overflow(_)       => None
+      case Event.NonStandard(_, p) => p.some
+    }
 
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
-  )(using F: Async[F], C: Console[F]): F[Unit] = 
-    for {
+  )(using F: Async[F], C: Console[F]): F[Unit] =
+    (for {
+      killSwitch <- F.deferred[Unit].toResource
+      flipKillSwitch = killSwitch.complete(()).void
 
-      cwd <- Files[F].currentWorkingDirectory
+      cwd <- Files[F].currentWorkingDirectory.toResource
 
-      eventQ <- Queue.unbounded[F, Event]
+      eventQ <- Queue.unbounded[F, Event].toResource
 
-      wsOut <- Queue.unbounded[F, String]
-
-      doNotWatchPath = (p: Fs2Path) =>
-        F.pure {
-          cli.ignore
-            .fold(false :: Nil)(rgxs =>
-              rgxs.map(rgx => rgx.r.findFirstIn(p.toString).isDefined)
-            )
-            .reduce(_ || _)
-        }
-
-      pathFromEvent = (ev: Event) =>
-        ev match {
-          case Event.Created(p, _)     => p.some
-          case Event.Deleted(p, _)     => p.some
-          case Event.Modified(p, _)    => p.some
-          case Event.Overflow(_)       => None
-          case Event.NonStandard(_, p) => p.some
-        }
+      wsOut <- Queue.unbounded[F, String].toResource
 
       _ <- cli.watch
         .getOrElse(cwd :: Nil)
-        .map(path =>
+        .parTraverse(
           Files[F]
-            .watch(path)
+            .watch(_)
             .evalMap(eventQ.offer)
             .compile
             .drain
         )
-        .parSequence
-        .start
+        .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
+        .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
         .map(pathFromEvent)
-        .evalFilterNot(_.existsM(doNotWatchPath))
+        .filterNot(_.fold(false)(cli.ignorePath))
         .debounce(cli.wait0)
-        .evalMap { pMaybe =>
+        .evalMap(pMaybe =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected ${pMaybe
-                .map(p => s"at `$p`")
-                .getOrElse("")}${AnsiColor.RESET}"""
+            s"""${AnsiColor.CYAN}Changes detected ${pMaybe.fold("")(p =>
+                s"in `$p`"
+              )}${AnsiColor.RESET}"""
           )
-
-        }
+        )
         .compile
         .drain
-        .start
+        .background
 
-      app <- {
-        val sf = new StaticFileServer[F](cli.entryFile).routes
-        for {
-          // proxy middleware
-          app0 <- cli.proxy.fold(F.pure(sf)) { case (path, url) =>
-            EmberClientBuilder.default[F].build.use { client =>
-              F.delay(ProxyMiddleware.default(sf, path, url, client))
-            }
+      indexHtmlWithInjectedScriptTag <- (for {
+        indexHtml <- Files[F].readUtf8(cli.entryFile).compile.onlyOrError
+
+        scriptTagToInject <- fs2.io
+          .readClassLoaderResource[F]("injected.html")
+          .through(fs2.text.utf8Decode)
+          .compile
+          .onlyOrError
+
+        result <- F.fromOption(
+          ScriptInjector(indexHtml, scriptTagToInject),
+          new RuntimeException("Failed to inject script tag")
+        )
+      } yield result).toResource
+
+      app <- Resource
+        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag).routes)
+        .flatMap(app0 =>
+          cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
+            EmberClientBuilder
+              .default[F]
+              .build
+              .map(client => ProxyMiddleware(path, url, client)(app0))
           }
-          // CORS middleware
-          app1 =
-            if (cli.cors) { middleware.CORS.policy.withAllowOriginAll(sf) }
-            else app0
-          // logging middleware
-          app2 =
-            if (cli.verbose) {
-              middleware.Logger.httpRoutes[F](
-                logHeaders = true,
-                logBody = true,
-                logAction = ((msg: String) => C.println(msg)).some
-              )(app1)
-            } else app1
+        )
+        .map(ErrorLoggingMiddleware[F])
+        .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
+        .map(
+          cli.verbose.applyIf(_)(
+            middleware.Logger.httpRoutes[F](
+              logHeaders = true,
+              logBody = true,
+              logAction = ((msg: String) => C.println(msg)).some
+            )(_)
+          )
+        )
 
-        } yield app2
-      }
-
-      _ <- EmberServerBuilder
+      server <- EmberServerBuilder
         .default[F]
         .withHost(cli.host)
         .withPort(cli.port)
@@ -234,27 +243,26 @@ object LiveServer
             s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
           )
         }
-        .use(_ => F.never[Unit])
 
-    } yield ()
+    } yield killSwitch.get).useEval
 
   def runServer[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    runServerImpl(cli).handleErrorWith { case th =>
+    runServerImpl(cli).recoverWith { case ex: java.net.BindException =>
       for {
+        _ <- C.errorln(ex.toString)
         _ <- C.println(
-          s"""${AnsiColor.RED}Failed to start server. Perhaps port ${cli.port} already in use.
+          s"""${AnsiColor.RED}Failed to start server.
+          Perhaps port ${cli.port} is already in use.
           Attempt to find other port ..${AnsiColor.RESET}"""
         )
         rg <- Random.scalaUtilRandom[F]
-        newPortMaybe <- rg.betweenInt(1024, 65535).map(Port.fromInt)
-        newPort <- F.fromOption(
-          newPortMaybe,
-          new IllegalArgumentException("Bad port")
-        )
-        server <- runServer(cli.withPort(newPort))
-      } yield server
+        newPort <- rg
+          .betweenInt(1024, 65535)
+          .map(Port.fromInt(_).get) // `get` is safe here
+        _ <- runServer(cli.withPort(newPort))
+      } yield ()
     }
 
   override def main: Opts[IO[ExitCode]] = {
@@ -276,13 +284,15 @@ object LiveServer
         .map(_.milliseconds)
 
     val entryFile = Opts
-      .option[String]("entry-file", "Index html to be served as entry file")
+      .option[String](
+        "entry-file",
+        "Index html to be served as entry file - defaults to `index.html`"
+      )
       .withDefault("index.html")
       .map(ef => Fs2Path(ef))
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
-      .map(_.toList)
       .orNone
 
     val watch = Opts
@@ -318,12 +328,9 @@ object LiveServer
         proxy,
         cors,
         verbose
-      ).mapN(
-        Cli.apply
-      )
+      ).mapN(Cli.apply)
 
-    val app = cli.map(cl => runServer[IO](cl).as(ExitCode.Success))
-    app
+    cli.map(runServer[IO](_).as(ExitCode.Success))
 
   }
 }
