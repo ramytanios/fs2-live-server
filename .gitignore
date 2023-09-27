@@ -2,3 +2,5 @@
 .metals/
 .scala-build/
 __pycache__/
+live-server
+live-server.build_artifacts.txt
