@@ -1,17 +1,17 @@
-import cats.effect.implicits.*
-import cats.effect.IOApp.Simple
 import cats.effect.IO
+import cats.effect.IOApp.Simple
+import cats.effect.implicits.*
 import cats.effect.kernel.Async
 import cats.effect.kernel.Resource
-import cats.implicits.* // <+>
-import org.http4s.server.Server
+import cats.implicits.*
 import com.comcast.ip4s.Host
 import com.comcast.ip4s.Port
-import org.http4s.ember.server.EmberServerBuilder
-import org.http4s.dsl.Http4sDsl
-import org.http4s.HttpRoutes
-import org.http4s.server.Router
 import fs2.io.net.Network
+import org.http4s.HttpRoutes
+import org.http4s.dsl.Http4sDsl
+import org.http4s.ember.server.EmberServerBuilder
+import org.http4s.server.Router
+import org.http4s.server.Server
 
 object MockServer extends Simple {
 

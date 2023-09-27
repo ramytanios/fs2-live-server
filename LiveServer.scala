@@ -1,35 +1,38 @@
+import cats.MonadThrow
+import cats.data.Kleisli
+import cats.data.NonEmptyList
+import cats.data.OptionT
 import cats.effect.*
 import cats.effect.implicits.*
-import cats.effect.std.Queue
 import cats.effect.std.Console
+import cats.effect.std.Queue
 import cats.effect.std.Random
-import org.http4s.server.websocket.WebSocketBuilder2
-import fs2.io.file.Files
-import org.http4s.websocket.WebSocketFrame
-import org.http4s.server.middleware
-import com.comcast.ip4s.*
-import org.http4s.ember.server.EmberServerBuilder
-import fs2.io.file.{Path => Fs2Path}
 import cats.syntax.all.*
-import org.http4s.dsl.io.*
-import org.http4s.*
-import org.http4s.dsl.*
-import scala.io.AnsiColor
-import scala.concurrent.duration.*
-import org.http4s.server.Server
-import fs2.io.file.Watcher.Event
+import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
+import fs2.io.file.Files
+import fs2.io.file.Watcher.Event
+import fs2.io.file.{Path => Fs2Path}
 import fs2.io.net.Network
-import org.typelevel.ci.CIString
-import org.http4s.headers.`Content-Type`
-import cats.data.Kleisli
-import org.http4s.client.Client
-import org.http4s.ember.client.EmberClientBuilder
+import mouse.all.*
 import org.http4s.Uri.{Path => UriPath}
-import cats.data.OptionT
-import cats.data.NonEmptyList
+import org.http4s.*
+import org.http4s.client.Client
+import org.http4s.dsl.*
+import org.http4s.dsl.io.*
+import org.http4s.ember.client.EmberClientBuilder
+import org.http4s.ember.server.EmberServerBuilder
+import org.http4s.headers.`Content-Type`
+import org.http4s.server.Server
+import org.http4s.server.middleware
+import org.http4s.server.websocket.WebSocketBuilder2
+import org.http4s.websocket.WebSocketFrame
+import org.typelevel.ci.CIString
+
 import java.net.BindException
+import scala.concurrent.duration.*
+import scala.io.AnsiColor
 
 object LiveServer
     extends CommandIOApp(
@@ -67,8 +70,7 @@ object LiveServer
           .fromQueueUnterminated(sq)
           .map(message => WebSocketFrame.Text(message))
 
-      val receive: fs2.Pipe[F, WebSocketFrame, Unit] =
-        is => is.evalMap { _ => F.unit }
+      val receive: fs2.Pipe[F, WebSocketFrame, Unit] = _.drain
 
       wsb.build(send, receive)
     }
@@ -85,37 +87,37 @@ object LiveServer
 
   // static file server
   final class StaticFileServer[F[_]: Files](
-      entryFile: Fs2Path
-  )(using F: Concurrent[F], C: Console[F])
+      indexHtml: String
+  )(using F: Async[F], C: Console[F])
       extends Http4sDsl[F] {
 
-    private val injectedPath = Fs2Path("injected.html")
-
     private def readFileF(path: Fs2Path): F[String] =
-      Files[F].readUtf8(path).compile.lastOrError
+      Files[F].readUtf8(path).compile.onlyOrError
 
     val routes: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root =>
-        for {
-          index <- readFileF(entryFile)
-          script <- readFileF(injectedPath)
-          index0 <- F.fromOption(
-            ScriptInjector(index, script),
-            new RuntimeException("Failed to serve index.html")
-          )
-          mediaType <- F.fromOption(
-            MediaType.forExtension("html"),
-            new RuntimeException("Invalid media type")
-          )
-        } yield Response[F]()
-          .withEntity(index0)
-          .withContentType(`Content-Type`(mediaType, Charset.`UTF-8`))
+        Response[F]()
+          .withEntity(indexHtml)
+          .withContentType(`Content-Type`(MediaType.text.html, Charset.`UTF-8`))
+          .pure[F]
 
-      case GET -> Root / fileName =>
+      case GET -> path =>
         StaticFile
-          .fromPath[F](Fs2Path(fileName))
+          .fromPath[F](Fs2Path(s".${path.toString}"))
           .getOrElseF(NotFound())
     }
+  }
+
+  object ErrorLoggingMiddleware {
+
+    def apply[F[_]: MonadThrow: Console](routes: HttpRoutes[F]): HttpRoutes[F] =
+      org.http4s.server.middleware.ErrorAction.httpRoutes
+        .log(
+          routes,
+          (t, msg) => Console[F].errorln(s"$msg: $t"),
+          (t, msg) => Console[F].errorln(s"$msg: $t")
+        )
+
   }
 
   object ProxyMiddleware {
@@ -188,8 +190,23 @@ object LiveServer
         .drain
         .background
 
+      indexHtmlWithInjectedScriptTag <- (for {
+        indexHtml <- Files[F].readUtf8(cli.entryFile).compile.onlyOrError
+
+        scriptTagToInject <- fs2.io
+          .readClassLoaderResource[F]("injected.html")
+          .through(fs2.text.utf8Decode)
+          .compile
+          .onlyOrError
+
+        result <- F.fromOption(
+          ScriptInjector(indexHtml, scriptTagToInject),
+          new RuntimeException("Failed to inject script tag")
+        )
+      } yield result).toResource
+
       app <- Resource
-        .pure(new StaticFileServer[F](cli.entryFile).routes)
+        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag).routes)
         .flatMap(app0 =>
           cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
             EmberClientBuilder
@@ -198,18 +215,16 @@ object LiveServer
               .map(client => ProxyMiddleware(path, url, client)(app0))
           }
         )
-        .map(app0 =>
-          if (cli.cors) middleware.CORS.policy.withAllowOriginAll(app0)
-          else app0
-        )
-        .map(app0 =>
-          if (cli.verbose) {
+        .map(ErrorLoggingMiddleware[F])
+        .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
+        .map(
+          cli.verbose.applyIf(_)(
             middleware.Logger.httpRoutes[F](
               logHeaders = true,
               logBody = true,
               logAction = ((msg: String) => C.println(msg)).some
-            )(app0)
-          } else app0
+            )(_)
+          )
         )
 
       server <- EmberServerBuilder
@@ -269,7 +284,10 @@ object LiveServer
         .map(_.milliseconds)
 
     val entryFile = Opts
-      .option[String]("entry-file", "Index html to be served as entry file")
+      .option[String](
+        "entry-file",
+        "Index html to be served as entry file - defaults to `index.html`"
+      )
       .withDefault("index.html")
       .map(ef => Fs2Path(ef))
 
