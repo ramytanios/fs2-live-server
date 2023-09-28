@@ -5,7 +5,6 @@ scala-cli --power package --native-image . \
 	-o live-server \
 	--jvm 17 \
 	-- \
-	-H:IncludeResources=".*" \
 	--initialize-at-build-time \
 	--no-fallback \
 	--enable-http \
