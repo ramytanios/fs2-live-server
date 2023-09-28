@@ -44,6 +44,7 @@ object LiveServer
       host: Host,
       port: Port,
       wait0: FiniteDuration,
+      cwd: Option[Fs2Path],
       entryFile: Fs2Path,
       ignore: Option[NonEmptyList[String]],
       watch: Option[List[Fs2Path]],
@@ -87,7 +88,8 @@ object LiveServer
 
   // static file server
   final class StaticFileServer[F[_]: Files](
-      indexHtml: String
+      indexHtml: String,
+      cwd: Fs2Path
   )(using F: Async[F], C: Console[F])
       extends Http4sDsl[F] {
 
@@ -103,7 +105,7 @@ object LiveServer
 
       case GET -> path =>
         StaticFile
-          .fromPath[F](Fs2Path(s".${path.toString}"))
+          .fromPath[F](cwd / Fs2Path(s".${path.toString}"))
           .getOrElseF(NotFound())
     }
   }
@@ -156,7 +158,9 @@ object LiveServer
       killSwitch <- F.deferred[Unit].toResource
       flipKillSwitch = killSwitch.complete(()).void
 
-      cwd <- Files[F].currentWorkingDirectory.toResource
+      cwd <- cli.cwd
+        .fold(Files[F].currentWorkingDirectory)(_.pure[F])
+        .toResource
 
       eventQ <- Queue.unbounded[F, Event].toResource
 
@@ -191,7 +195,7 @@ object LiveServer
         .background
 
       indexHtmlWithInjectedScriptTag <- (for {
-        indexHtml <- Files[F].readUtf8(cli.entryFile).compile.onlyOrError
+        indexHtml <- Files[F].readUtf8(cwd / cli.entryFile).compile.onlyOrError
 
         result <- F.fromOption(
           ScriptInjector(indexHtml, scriptTagToInject),
@@ -200,7 +204,7 @@ object LiveServer
       } yield result).toResource
 
       app <- Resource
-        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag).routes)
+        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes)
         .flatMap(app0 =>
           cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
             EmberClientBuilder
@@ -277,6 +281,12 @@ object LiveServer
         .withDefault(1000)
         .map(_.milliseconds)
 
+    val cwd =
+      Opts
+        .option[String]("cwd", "Current working directory")
+        .map(p => Fs2Path(p))
+        .orNone
+
     val entryFile = Opts
       .option[String](
         "entry-file",
@@ -316,6 +326,7 @@ object LiveServer
         host,
         port,
         wait0,
+        cwd,
         entryFile,
         ignore,
         watch,
