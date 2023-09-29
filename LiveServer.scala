@@ -11,6 +11,7 @@ import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
+import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
 import fs2.io.file.Watcher.Event
 import fs2.io.file.{Path => Fs2Path}
@@ -151,6 +152,44 @@ object LiveServer
       case Event.NonStandard(_, p) => p.some
     }
 
+  trait PathWatcher[F[_]] {
+    def changes: fs2.Stream[F, Unit]
+  }
+  object PathWatcher {
+    def apply[F[_]: Temporal: Files](
+        p: Fs2Path,
+        watchEvery: FiniteDuration
+    ): Resource[F, PathWatcher[F]] =
+      for {
+        currentLtm <- Files[F].getLastModifiedTime(p).toResource
+        ltm <- SignallingRef.of[F, FiniteDuration](currentLtm).toResource
+        _ <- fs2.Stream
+          .fixedDelay(watchEvery)
+          .evalMap { _ =>
+            Files[F].getLastModifiedTime(p).flatMap(ltm.set)
+          }
+          .compile
+          .drain
+          .background
+      } yield new PathWatcher[F] {
+        override def changes: fs2.Stream[F, Unit] =
+          ltm.changes.discrete.as(())
+      }
+  }
+
+  def watchPathToQ[F[_]: Concurrent: Temporal: Files](
+      p: Fs2Path,
+      watchEvery: FiniteDuration,
+      q: Queue[F, Fs2Path]
+  ): F[Unit] =
+    fs2.Stream
+      .resource(PathWatcher(p, watchEvery))
+      .flatMap(_.changes)
+      .as(p)
+      .evalMap(q.offer)
+      .compile
+      .drain
+
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
@@ -162,49 +201,49 @@ object LiveServer
         .fold(Files[F].currentWorkingDirectory)(_.pure[F])
         .toResource
 
-      eventQ <- Queue.unbounded[F, Event].toResource
+      eventQ <- Queue.unbounded[F, Fs2Path].toResource
 
       wsOut <- Queue.unbounded[F, String].toResource
 
-      _ <- cli.watch
-        .getOrElse(cwd :: Nil)
-        .parTraverse(
-          Files[F]
-            .watch(_)
-            .evalMap(eventQ.offer)
-            .compile
-            .drain
-        )
+      _ <- fs2.Stream
+        .emits(cli.watch.getOrElse(cwd :: Nil))
+        .covary[F]
+        .flatMap(p => Files[F].walk(p))
+        .parEvalMapUnorderedUnbounded(p => watchPathToQ(p, 1.second, eventQ))
+        .compile
+        .drain
         .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
         .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
-        .map(pathFromEvent)
-        .filterNot(_.fold(false)(cli.ignorePath))
+        .filterNot(cli.ignorePath)
         .debounce(cli.wait0)
-        .evalMap(pMaybe =>
+        .evalMap(p =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected ${pMaybe.fold("")(p =>
-                s"in `$p`"
-              )}${AnsiColor.RESET}"""
+            s"""${AnsiColor.CYAN}Changes detected in `$p`${AnsiColor.RESET}"""
           )
         )
         .compile
         .drain
         .background
 
-      indexHtmlWithInjectedScriptTag <- (for {
-        indexHtml <- Files[F].readUtf8(cwd / cli.entryFile).compile.onlyOrError
-
-        result <- F.fromOption(
-          ScriptInjector(indexHtml, scriptTagToInject),
-          new RuntimeException("Failed to inject script tag")
-        )
-      } yield result).toResource
+      indexHtmlWithInjectedScriptTag <- Files[F]
+        .readUtf8(cwd / cli.entryFile)
+        .compile
+        .onlyOrError
+        .flatMap { indexHtml =>
+          F.fromOption(
+            ScriptInjector(indexHtml, scriptTagToInject),
+            new RuntimeException("Failed to inject script tag")
+          )
+        }
+        .toResource
 
       app <- Resource
-        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes)
+        .pure(
+          new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes
+        )
         .flatMap(app0 =>
           cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
             EmberClientBuilder
