@@ -4,7 +4,6 @@ import cats.data.NonEmptyList
 import cats.data.OptionT
 import cats.effect.*
 import cats.effect.implicits.*
-import cats.effect.kernel.Outcome
 import cats.effect.std.Console
 import cats.effect.std.Queue
 import cats.effect.std.Random
@@ -64,7 +63,6 @@ object LiveServer
 
   }
 
-  // websocket connection
   final class Websocket[F[_]](wsb: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
   ) extends Http4sDsl[F] {
@@ -80,7 +78,6 @@ object LiveServer
     }
   }
 
-  // script injector
   object ScriptInjector {
     def apply(html: String, script: String): Option[String] =
       html.indexOf("</html>") match {
@@ -89,7 +86,6 @@ object LiveServer
       }
   }
 
-  // static file server
   final class StaticFileServer[F[_]: Files](
       indexHtml: String,
       cwd: Fs2Path
@@ -146,8 +142,11 @@ object LiveServer
   }
 
   trait PathWatcher[F[_]] {
+
+    /** stream of notifications */
     def changes: fs2.Stream[F, Unit]
   }
+
   object PathWatcher {
     def apply[F[_]: Temporal: Files: Console](
         p: Fs2Path,
@@ -156,40 +155,42 @@ object LiveServer
       for {
         currentLtm <- Files[F].getLastModifiedTime(p).toResource
 
+        currentExists <- Files[F].exists(p).toResource
+
         ltm <- SignallingRef
           .of[F, Option[FiniteDuration]](currentLtm.some)
           .toResource
 
-        currentExists <- Files[F].exists(p).toResource
-
-        exists <- SignallingRef.of[F, Boolean](currentExists).toResource
+        exists <- SignallingRef
+          .of[F, Boolean](currentExists)
+          .toResource
 
         _ <- fs2.Stream
           .fixedDelay(watchEvery)
           .evalMap(_ =>
-            Files[F]
-              .exists(p)
-              .flatMap(bo =>
-                exists.set(bo) *> {
-                  if (bo)
-                    Files[F]
-                      .getLastModifiedTime(p)
-                      .flatMap(dur => ltm.set(dur.some))
-                  else ltm.set(None)
-                }
-              )
+            val existF = Files[F].exists(p)
+            existF.flatMap(exists.set) *>
+              Temporal[F]
+                .ifM(existF)(
+                  Files[F]
+                    .getLastModifiedTime(p)
+                    .flatMap(dur => ltm.set(dur.some)),
+                  ltm.set(None)
+                )
           )
           .interruptWhen(exists.map(!_))
           .compile
           .drain
           .background
+
       } yield new PathWatcher[F] {
+
         override def changes: fs2.Stream[F, Unit] =
           ltm.changes.discrete.as(())
       }
   }
 
-  def watchPathToQ[F[_]: Concurrent: Temporal: Files: Console](
+  def watchPathImpl[F[_]: Concurrent: Temporal: Files: Console](
       p: Fs2Path,
       watchEvery: FiniteDuration,
       q: Queue[F, Fs2Path]
@@ -221,7 +222,7 @@ object LiveServer
         .emits(cli.watch.getOrElse(cwd :: Nil))
         .covary[F]
         .flatMap(Files[F].walk(_))
-        .parEvalMapUnorderedUnbounded(watchPathToQ(_, 1.second, eventQ))
+        .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
         .compile
         .drain
         .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
@@ -271,7 +272,7 @@ object LiveServer
             middleware.Logger.httpRoutes[F](
               logHeaders = true,
               logBody = true,
-              logAction = ((msg: String) => C.println(msg)).some
+              logAction = (C.println).some
             )(_)
           )
         )
@@ -319,12 +320,12 @@ object LiveServer
     val host = Opts
       .option[String]("host", "Host")
       .withDefault("127.0.0.1")
-      .mapValidated(host => Host.fromString(host).toValidNel("Invalid host"))
+      .mapValidated(Host.fromString(_).toValidNel("Invalid host"))
 
     val port = Opts
       .option[Int]("port", "Port")
       .withDefault(8080)
-      .mapValidated(port => Port.fromInt(port).toValidNel("Invalid port"))
+      .mapValidated(Port.fromInt(_).toValidNel("Invalid port"))
 
     val wait0 =
       Opts
@@ -335,7 +336,7 @@ object LiveServer
     val cwd =
       Opts
         .option[String]("cwd", "Current working directory")
-        .map(p => Fs2Path(p))
+        .map(Fs2Path(_))
         .orNone
 
     val entryFile = Opts
@@ -344,7 +345,7 @@ object LiveServer
         "Index html to be served as entry file - defaults to `index.html`"
       )
       .withDefault("index.html")
-      .map(ef => Fs2Path(ef))
+      .map(Fs2Path(_))
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
@@ -352,7 +353,7 @@ object LiveServer
 
     val watch = Opts
       .options[String]("watch", "List of paths to watch")
-      .map(_.toList.map(p => Fs2Path(p)))
+      .map(_.toList.map(Fs2Path(_)))
       .orNone
 
     val proxy = Opts
@@ -390,35 +391,36 @@ object LiveServer
 
   }
 
-  private lazy val scriptTagToInject = """<script type="text/javascript">
-// Code injected by fs2-live-server
-// <![CDATA[  <-- For SVG support
-if ('WebSocket' in window) {
-	(function() {
-		function refreshCSS() {
-			var sheets = [].slice.call(document.getElementsByTagName("link"));
-			var head = document.getElementsByTagName("head")[0];
-			for (var i = 0; i < sheets.length; ++i) {
-				var elem = sheets[i];
-				head.removeChild(elem);
-				var rel = elem.rel;
-				if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
-					var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
-					elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
-				}
-				head.appendChild(elem);
-			}
-		}
-		var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
-		var address = protocol + window.location.host + window.location.pathname + 'ws';
-		var socket = new WebSocket(address);
-		socket.onmessage = function(msg) {
-			if (msg.data == 'reload') window.location.reload();
-			else if (msg.data == 'refreshcss') refreshCSS();
-		};
-		console.log('Live reload enabled.');
-	})();
-}
-</script>"""
+  private lazy val scriptTagToInject = """
+  <script type="text/javascript">
+  // Code injected by fs2-live-server
+  // <![CDATA[  <-- For SVG support
+    if ('WebSocket' in window) {
+	    (function() {
+		    function refreshCSS() {
+			    var sheets = [].slice.call(document.getElementsByTagName("link"));
+			    var head = document.getElementsByTagName("head")[0];
+			    for (var i = 0; i < sheets.length; ++i) {
+				      var elem = sheets[i];
+				      head.removeChild(elem);
+				      var rel = elem.rel;
+				      if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
+					      var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
+					      elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
+      				}
+		      		head.appendChild(elem);
+			    }
+		    }
+		  var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
+		  var address = protocol + window.location.host + window.location.pathname + 'ws';
+		  var socket = new WebSocket(address);
+		  socket.onmessage = function(msg) {
+			  if (msg.data == 'reload') window.location.reload();
+			  else if (msg.data == 'refreshcss') refreshCSS();
+		  };
+		  console.log('Live reload enabled.');
+	  })();
+  }
+  </script>"""
 
 }
