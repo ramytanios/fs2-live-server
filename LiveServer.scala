@@ -4,9 +4,11 @@ import cats.data.NonEmptyList
 import cats.data.OptionT
 import cats.effect.*
 import cats.effect.implicits.*
+import cats.effect.kernel.Outcome
 import cats.effect.std.Console
 import cats.effect.std.Queue
 import cats.effect.std.Random
+import cats.effect.std.Supervisor
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
@@ -143,31 +145,41 @@ object LiveServer
 
   }
 
-  def pathFromEvent(ev: Event): Option[Fs2Path] =
-    ev match {
-      case Event.Created(p, _)     => p.some
-      case Event.Deleted(p, _)     => p.some
-      case Event.Modified(p, _)    => p.some
-      case Event.Overflow(_)       => None
-      case Event.NonStandard(_, p) => p.some
-    }
-
   trait PathWatcher[F[_]] {
     def changes: fs2.Stream[F, Unit]
   }
   object PathWatcher {
-    def apply[F[_]: Temporal: Files](
+    def apply[F[_]: Temporal: Files: Console](
         p: Fs2Path,
         watchEvery: FiniteDuration
-    ): Resource[F, PathWatcher[F]] =
+    )(implicit C: Console[F]): Resource[F, PathWatcher[F]] =
       for {
         currentLtm <- Files[F].getLastModifiedTime(p).toResource
-        ltm <- SignallingRef.of[F, FiniteDuration](currentLtm).toResource
+
+        ltm <- SignallingRef
+          .of[F, Option[FiniteDuration]](currentLtm.some)
+          .toResource
+
+        currentExists <- Files[F].exists(p).toResource
+
+        exists <- SignallingRef.of[F, Boolean](currentExists).toResource
+
         _ <- fs2.Stream
           .fixedDelay(watchEvery)
-          .evalMap { _ =>
-            Files[F].getLastModifiedTime(p).flatMap(ltm.set)
-          }
+          .evalMap(_ =>
+            Files[F]
+              .exists(p)
+              .flatMap(bo =>
+                exists.set(bo) *> {
+                  if (bo)
+                    Files[F]
+                      .getLastModifiedTime(p)
+                      .flatMap(dur => ltm.set(dur.some))
+                  else ltm.set(None)
+                }
+              )
+          )
+          .interruptWhen(exists.map(!_))
           .compile
           .drain
           .background
@@ -177,7 +189,7 @@ object LiveServer
       }
   }
 
-  def watchPathToQ[F[_]: Concurrent: Temporal: Files](
+  def watchPathToQ[F[_]: Concurrent: Temporal: Files: Console](
       p: Fs2Path,
       watchEvery: FiniteDuration,
       q: Queue[F, Fs2Path]
@@ -208,8 +220,8 @@ object LiveServer
       _ <- fs2.Stream
         .emits(cli.watch.getOrElse(cwd :: Nil))
         .covary[F]
-        .flatMap(p => Files[F].walk(p))
-        .parEvalMapUnorderedUnbounded(p => watchPathToQ(p, 1.second, eventQ))
+        .flatMap(Files[F].walk(_))
+        .parEvalMapUnorderedUnbounded(watchPathToQ(_, 1.second, eventQ))
         .compile
         .drain
         .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
