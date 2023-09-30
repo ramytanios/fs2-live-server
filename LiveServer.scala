@@ -153,12 +153,12 @@ object LiveServer
         watchEvery: FiniteDuration
     )(implicit C: Console[F]): Resource[F, PathWatcher[F]] =
       for {
-        currentLtm <- Files[F].getLastModifiedTime(p).toResource
+        currentLmt <- Files[F].getLastModifiedTime(p).toResource
 
         currentExists <- Files[F].exists(p).toResource
 
-        ltm <- SignallingRef
-          .of[F, Option[FiniteDuration]](currentLtm.some)
+        lmt <- SignallingRef
+          .of[F, Option[FiniteDuration]](currentLmt.some)
           .toResource
 
         exists <- SignallingRef
@@ -174,8 +174,8 @@ object LiveServer
                 .ifM(existF)(
                   Files[F]
                     .getLastModifiedTime(p)
-                    .flatMap(dur => ltm.set(dur.some)),
-                  ltm.set(None)
+                    .flatMap(dur => lmt.set(dur.some)),
+                  lmt.set(None)
                 )
           )
           .interruptWhen(exists.map(!_))
@@ -186,7 +186,7 @@ object LiveServer
       } yield new PathWatcher[F] {
 
         override def changes: fs2.Stream[F, Unit] =
-          ltm.changes.discrete.as(())
+          lmt.changes.discrete.as(())
       }
   }
 
