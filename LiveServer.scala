@@ -177,7 +177,7 @@ object LiveServer
       } yield new PathWatcher[F] {
 
         override def changes: fs2.Stream[F, Unit] =
-          lmt.changes.discrete.as(())
+          lmt.changes.discrete.as(()).tail
       }
   }
 
