@@ -155,30 +155,21 @@ object LiveServer
       for {
         currentLmt <- Files[F].getLastModifiedTime(p).toResource
 
-        currentExists <- Files[F].exists(p).toResource
-
         lmt <- SignallingRef
           .of[F, Option[FiniteDuration]](currentLmt.some)
-          .toResource
-
-        exists <- SignallingRef
-          .of[F, Boolean](currentExists)
           .toResource
 
         _ <- fs2.Stream
           .fixedDelay(watchEvery)
           .evalMap(_ =>
-            val existF = Files[F].exists(p)
-            existF.flatMap(exists.set) *>
-              Temporal[F]
-                .ifM(existF)(
-                  Files[F]
-                    .getLastModifiedTime(p)
-                    .flatMap(dur => lmt.set(dur.some)),
-                  lmt.set(None)
-                )
+            Temporal[F].ifM(Files[F].exists(p))(
+              Files[F]
+                .getLastModifiedTime(p)
+                .flatMap(dur => lmt.set(dur.some)),
+              lmt.set(None)
+            )
           )
-          .interruptWhen(exists.map(!_))
+          .interruptWhen(lmt.map(_.isEmpty))
           .compile
           .drain
           .background
