@@ -266,6 +266,22 @@ object LiveServer
           }
         )
         .map(ErrorLoggingMiddleware[F])
+        .map(
+          middleware.RequestLogger.httpRoutes[F](
+            logHeaders = false,
+            logBody = false,
+            logAction = (
+                (msg: String) =>
+                  msg.split(" ").toList match {
+                    case List(http, method, path) =>
+                      C.println(
+                        s"${AnsiColor.YELLOW}$http${AnsiColor.RESET} ${AnsiColor.BLUE}$method${AnsiColor.RESET} $path"
+                      )
+                    case other => C.println(other)
+                  }
+            ).some
+          )
+        )
         .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
         .map(
           cli.verbose.applyIf(_)(
@@ -286,12 +302,17 @@ object LiveServer
         )
         .build
         .evalTap { _ =>
-          C.println(
-            s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
-              |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
-          ) *> C.println(
-            s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
-          )
+          {
+            val segment = cli.proxy.map(_._1.toString).getOrElse("")
+            val uri = cli.proxy.map(_._2.toString).getOrElse("")
+            C.println(
+              s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
+                  |http://${cli.host}:${cli.port}
+                  |Remapping /$segment to $uri/$segment ${AnsiColor.RESET}""".stripMargin
+            ) *> C.println(
+              s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
+            )
+          }
         }
 
     } yield killSwitch.get).useEval
