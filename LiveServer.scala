@@ -7,7 +7,6 @@ import cats.effect.implicits.*
 import cats.effect.std.Console
 import cats.effect.std.Queue
 import cats.effect.std.Random
-import cats.effect.std.Supervisor
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
@@ -158,7 +157,7 @@ object LiveServer extends EpollApp {
               msg.split(" ").toList match {
                 case List(http, method, path) =>
                   C.println(
-                    s"${AnsiColor.YELLOW}$http${AnsiColor.RESET} ${AnsiColor.BLUE}$method${AnsiColor.RESET} $path"
+                    s"${AnsiColor.YELLOW}$http${AnsiColor.BLUE} $method${AnsiColor.RESET} $path"
                   )
                 case other => C.println(other)
               }
