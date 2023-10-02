@@ -349,17 +349,15 @@ object LiveServer extends EpollApp {
       .withDefault(8080)
       .mapValidated(Port.fromInt(_).toValidNel("Invalid port"))
 
-    val wait0 =
-      Opts
-        .option[Int]("wait", "Wait before reload (ms)")
-        .withDefault(1000)
-        .map(_.milliseconds)
+    val wait0 = Opts
+      .option[Int]("wait", "Wait before reload (ms)")
+      .withDefault(1000)
+      .map(_.milliseconds)
 
-    val cwd =
-      Opts
-        .option[String]("cwd", "Current working directory")
-        .map(Fs2Path(_))
-        .orNone
+    val cwd = Opts
+      .option[String]("cwd", "Current working directory")
+      .map(Fs2Path(_))
+      .orNone
 
     val entryFile = Opts
       .option[String](
@@ -389,25 +387,14 @@ object LiveServer extends EpollApp {
       })
       .orNone
 
-    val cors =
-      Opts.flag("cors", "Allow any origin requests").orFalse
+    val cors = Opts.flag("cors", "Allow any origin requests").orFalse
 
     val verbose =
       Opts.flag("verbose", "Logs all requests and responses", "V").orFalse
 
     val cli =
-      (
-        host,
-        port,
-        wait0,
-        cwd,
-        entryFile,
-        ignore,
-        watch,
-        proxy,
-        cors,
-        verbose
-      ).mapN(Cli.apply)
+      (host, port, wait0, cwd, entryFile, ignore, watch, proxy, cors, verbose)
+        .mapN(Cli.apply)
 
     cli.map(runServer[IO](_).as(ExitCode.Success))
 
