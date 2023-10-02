@@ -12,6 +12,7 @@ import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
+import epollcat.EpollApp
 import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
 import fs2.io.file.Watcher.Event
@@ -36,11 +37,14 @@ import java.net.BindException
 import scala.concurrent.duration.*
 import scala.io.AnsiColor
 
-object LiveServer
-    extends CommandIOApp(
-      name = "live server",
-      header = "Purely functional live server"
-    ) {
+object LiveServer extends EpollApp {
+
+  override final def run(args: List[String]): IO[ExitCode] =
+    CommandIOApp
+      .run[IO]("live server", "Purely functional live server", true, None)(
+        mainOpts,
+        args
+      )
 
   case class Cli(
       host: Host,
@@ -327,7 +331,7 @@ object LiveServer
       } yield ()
     }
 
-  override def main: Opts[IO[ExitCode]] = {
+  def mainOpts: Opts[IO[ExitCode]] = {
 
     val host = Opts
       .option[String]("host", "Host")

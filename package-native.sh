@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 
-scala-cli package . --main-class LiveServer -o live-server
+scala-cli --power package . --main-class LiveServer -o live-server
