@@ -145,6 +145,28 @@ object LiveServer extends EpollApp {
 
   }
 
+  object RequestsSimpleLoggingMiddleware {
+
+    def apply[F[_]: Async](httpRoutes: HttpRoutes[F])(using
+        C: Console[F]
+    ): HttpRoutes[F] =
+      middleware.RequestLogger.httpRoutes[F](
+        logHeaders = false,
+        logBody = false,
+        logAction = (
+            (msg: String) =>
+              msg.split(" ").toList match {
+                case List(http, method, path) =>
+                  C.println(
+                    s"${AnsiColor.YELLOW}$http${AnsiColor.RESET} ${AnsiColor.BLUE}$method${AnsiColor.RESET} $path"
+                  )
+                case other => C.println(other)
+              }
+        ).some
+      )(httpRoutes)
+
+  }
+
   trait PathWatcher[F[_]] {
 
     /** stream of notifications */
@@ -261,22 +283,7 @@ object LiveServer extends EpollApp {
           }
         )
         .map(ErrorLoggingMiddleware[F])
-        .map(
-          middleware.RequestLogger.httpRoutes[F](
-            logHeaders = false,
-            logBody = false,
-            logAction = (
-                (msg: String) =>
-                  msg.split(" ").toList match {
-                    case List(http, method, path) =>
-                      C.println(
-                        s"${AnsiColor.YELLOW}$http${AnsiColor.RESET} ${AnsiColor.BLUE}$method${AnsiColor.RESET} $path"
-                      )
-                    case other => C.println(other)
-                  }
-            ).some
-          )
-        )
+        .map(RequestsSimpleLoggingMiddleware[F])
         .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
         .map(
           cli.verbose.applyIf(_)(
