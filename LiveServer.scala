@@ -212,7 +212,7 @@ object LiveServer
       _ <- fs2.Stream
         .emits(cli.watch.getOrElse(cwd :: Nil))
         .covary[F]
-        .flatMap(Files[F].walk(_))
+        .flatMap(Files[F].walk(_, 1, false))
         .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
         .compile
         .drain
