@@ -3,8 +3,9 @@
 scala-cli --power package --native-image . \
 	--main-class LiveServer \
 	-o live-server \
-	--jvm 17 \
+  --java-home "$JAVA_HOME" \
 	-- \
+  -H:-CheckToolchain \
 	--initialize-at-build-time \
 	--no-fallback \
 	--enable-http \

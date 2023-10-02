@@ -7,10 +7,13 @@ import cats.effect.implicits.*
 import cats.effect.std.Console
 import cats.effect.std.Queue
 import cats.effect.std.Random
+import cats.effect.std.Supervisor
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
+import epollcat.EpollApp
+import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
 import fs2.io.file.Watcher.Event
 import fs2.io.file.{Path => Fs2Path}
@@ -34,11 +37,14 @@ import java.net.BindException
 import scala.concurrent.duration.*
 import scala.io.AnsiColor
 
-object LiveServer
-    extends CommandIOApp(
-      name = "live server",
-      header = "Purely functional live server"
-    ) {
+object LiveServer extends EpollApp {
+
+  override final def run(args: List[String]): IO[ExitCode] =
+    CommandIOApp
+      .run[IO]("live server", "Purely functional live server", true, None)(
+        mainOpts,
+        args
+      )
 
   case class Cli(
       host: Host,
@@ -61,7 +67,6 @@ object LiveServer
 
   }
 
-  // websocket connection
   final class Websocket[F[_]](wsb: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
   ) extends Http4sDsl[F] {
@@ -77,7 +82,6 @@ object LiveServer
     }
   }
 
-  // script injector
   object ScriptInjector {
     def apply(html: String, script: String): Option[String] =
       html.indexOf("</html>") match {
@@ -86,7 +90,6 @@ object LiveServer
       }
   }
 
-  // static file server
   final class StaticFileServer[F[_]: Files](
       indexHtml: String,
       cwd: Fs2Path
@@ -142,14 +145,58 @@ object LiveServer
 
   }
 
-  def pathFromEvent(ev: Event): Option[Fs2Path] =
-    ev match {
-      case Event.Created(p, _)     => p.some
-      case Event.Deleted(p, _)     => p.some
-      case Event.Modified(p, _)    => p.some
-      case Event.Overflow(_)       => None
-      case Event.NonStandard(_, p) => p.some
-    }
+  trait PathWatcher[F[_]] {
+
+    /** stream of notifications */
+    def changes: fs2.Stream[F, Unit]
+  }
+
+  object PathWatcher {
+    def apply[F[_]: Temporal: Files: Console](
+        p: Fs2Path,
+        watchEvery: FiniteDuration
+    )(implicit C: Console[F]): Resource[F, PathWatcher[F]] =
+      for {
+        currentLmt <- Files[F].getLastModifiedTime(p).toResource
+
+        lmt <- SignallingRef
+          .of[F, Option[FiniteDuration]](currentLmt.some)
+          .toResource
+
+        _ <- fs2.Stream
+          .fixedDelay(watchEvery)
+          .evalMap(_ =>
+            Temporal[F].ifM(Files[F].exists(p))(
+              Files[F]
+                .getLastModifiedTime(p)
+                .flatMap(dur => lmt.set(dur.some)),
+              lmt.set(None)
+            )
+          )
+          .interruptWhen(lmt.map(_.isEmpty))
+          .compile
+          .drain
+          .background
+
+      } yield new PathWatcher[F] {
+
+        override def changes: fs2.Stream[F, Unit] =
+          lmt.changes.discrete.as(()).tail
+      }
+  }
+
+  def watchPathImpl[F[_]: Concurrent: Temporal: Files: Console](
+      p: Fs2Path,
+      watchEvery: FiniteDuration,
+      q: Queue[F, Fs2Path]
+  ): F[Unit] =
+    fs2.Stream
+      .resource(PathWatcher(p, watchEvery))
+      .flatMap(_.changes)
+      .as(p)
+      .evalMap(q.offer)
+      .compile
+      .drain
 
   def runServerImpl[F[_]: Files: Network](
       cli: Cli
@@ -162,49 +209,49 @@ object LiveServer
         .fold(Files[F].currentWorkingDirectory)(_.pure[F])
         .toResource
 
-      eventQ <- Queue.unbounded[F, Event].toResource
+      eventQ <- Queue.unbounded[F, Fs2Path].toResource
 
       wsOut <- Queue.unbounded[F, String].toResource
 
-      _ <- cli.watch
-        .getOrElse(cwd :: Nil)
-        .parTraverse(
-          Files[F]
-            .watch(_)
-            .evalMap(eventQ.offer)
-            .compile
-            .drain
-        )
+      _ <- fs2.Stream
+        .emits(cli.watch.getOrElse(cwd :: Nil))
+        .covary[F]
+        .flatMap(Files[F].walk(_, 1, false))
+        .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
+        .compile
+        .drain
         .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
         .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
-        .map(pathFromEvent)
-        .filterNot(_.fold(false)(cli.ignorePath))
+        .filterNot(cli.ignorePath)
         .debounce(cli.wait0)
-        .evalMap(pMaybe =>
+        .evalMap(p =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected ${pMaybe.fold("")(p =>
-                s"in `$p`"
-              )}${AnsiColor.RESET}"""
+            s"""${AnsiColor.CYAN}Changes detected in `$p`${AnsiColor.RESET}"""
           )
         )
         .compile
         .drain
         .background
 
-      indexHtmlWithInjectedScriptTag <- (for {
-        indexHtml <- Files[F].readUtf8(cwd / cli.entryFile).compile.onlyOrError
-
-        result <- F.fromOption(
-          ScriptInjector(indexHtml, scriptTagToInject),
-          new RuntimeException("Failed to inject script tag")
-        )
-      } yield result).toResource
+      indexHtmlWithInjectedScriptTag <- Files[F]
+        .readUtf8(cwd / cli.entryFile)
+        .compile
+        .onlyOrError
+        .flatMap { indexHtml =>
+          F.fromOption(
+            ScriptInjector(indexHtml, scriptTagToInject),
+            new RuntimeException("Failed to inject script tag")
+          )
+        }
+        .toResource
 
       app <- Resource
-        .pure(new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes)
+        .pure(
+          new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes
+        )
         .flatMap(app0 =>
           cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
             EmberClientBuilder
@@ -214,13 +261,29 @@ object LiveServer
           }
         )
         .map(ErrorLoggingMiddleware[F])
+        .map(
+          middleware.RequestLogger.httpRoutes[F](
+            logHeaders = false,
+            logBody = false,
+            logAction = (
+                (msg: String) =>
+                  msg.split(" ").toList match {
+                    case List(http, method, path) =>
+                      C.println(
+                        s"${AnsiColor.YELLOW}$http${AnsiColor.RESET} ${AnsiColor.BLUE}$method${AnsiColor.RESET} $path"
+                      )
+                    case other => C.println(other)
+                  }
+            ).some
+          )
+        )
         .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
         .map(
           cli.verbose.applyIf(_)(
             middleware.Logger.httpRoutes[F](
               logHeaders = true,
               logBody = true,
-              logAction = ((msg: String) => C.println(msg)).some
+              logAction = (C.println).some
             )(_)
           )
         )
@@ -234,12 +297,17 @@ object LiveServer
         )
         .build
         .evalTap { _ =>
-          C.println(
-            s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
-              |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
-          ) *> C.println(
-            s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
-          )
+          {
+            val segment = cli.proxy.map(_._1.toString).getOrElse("")
+            val uri = cli.proxy.map(_._2.toString).getOrElse("")
+            C.println(
+              s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
+                  |http://${cli.host}:${cli.port}
+                  |Remapping /$segment to $uri/$segment ${AnsiColor.RESET}""".stripMargin
+            ) *> C.println(
+              s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
+            )
+          }
         }
 
     } yield killSwitch.get).useEval
@@ -263,17 +331,17 @@ object LiveServer
       } yield ()
     }
 
-  override def main: Opts[IO[ExitCode]] = {
+  def mainOpts: Opts[IO[ExitCode]] = {
 
     val host = Opts
       .option[String]("host", "Host")
       .withDefault("127.0.0.1")
-      .mapValidated(host => Host.fromString(host).toValidNel("Invalid host"))
+      .mapValidated(Host.fromString(_).toValidNel("Invalid host"))
 
     val port = Opts
       .option[Int]("port", "Port")
       .withDefault(8080)
-      .mapValidated(port => Port.fromInt(port).toValidNel("Invalid port"))
+      .mapValidated(Port.fromInt(_).toValidNel("Invalid port"))
 
     val wait0 =
       Opts
@@ -284,7 +352,7 @@ object LiveServer
     val cwd =
       Opts
         .option[String]("cwd", "Current working directory")
-        .map(p => Fs2Path(p))
+        .map(Fs2Path(_))
         .orNone
 
     val entryFile = Opts
@@ -293,7 +361,7 @@ object LiveServer
         "Index html to be served as entry file - defaults to `index.html`"
       )
       .withDefault("index.html")
-      .map(ef => Fs2Path(ef))
+      .map(Fs2Path(_))
 
     val ignore = Opts
       .options[String]("ignore", "List of path regex to not watch")
@@ -301,7 +369,7 @@ object LiveServer
 
     val watch = Opts
       .options[String]("watch", "List of paths to watch")
-      .map(_.toList.map(p => Fs2Path(p)))
+      .map(_.toList.map(Fs2Path(_)))
       .orNone
 
     val proxy = Opts
@@ -339,35 +407,36 @@ object LiveServer
 
   }
 
-  private lazy val scriptTagToInject = """<script type="text/javascript">
-// Code injected by fs2-live-server
-// <![CDATA[  <-- For SVG support
-if ('WebSocket' in window) {
-	(function() {
-		function refreshCSS() {
-			var sheets = [].slice.call(document.getElementsByTagName("link"));
-			var head = document.getElementsByTagName("head")[0];
-			for (var i = 0; i < sheets.length; ++i) {
-				var elem = sheets[i];
-				head.removeChild(elem);
-				var rel = elem.rel;
-				if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
-					var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
-					elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
-				}
-				head.appendChild(elem);
-			}
-		}
-		var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
-		var address = protocol + window.location.host + window.location.pathname + 'ws';
-		var socket = new WebSocket(address);
-		socket.onmessage = function(msg) {
-			if (msg.data == 'reload') window.location.reload();
-			else if (msg.data == 'refreshcss') refreshCSS();
-		};
-		console.log('Live reload enabled.');
-	})();
-}
-</script>"""
+  private lazy val scriptTagToInject = """
+  <script type="text/javascript">
+  // Code injected by fs2-live-server
+  // <![CDATA[  <-- For SVG support
+    if ('WebSocket' in window) {
+	    (function() {
+		    function refreshCSS() {
+			    var sheets = [].slice.call(document.getElementsByTagName("link"));
+			    var head = document.getElementsByTagName("head")[0];
+			    for (var i = 0; i < sheets.length; ++i) {
+				      var elem = sheets[i];
+				      head.removeChild(elem);
+				      var rel = elem.rel;
+				      if (elem.href && typeof rel != "string" || rel.length == 0 || rel.toLowerCase() == "stylesheet") {
+					      var url = elem.href.replace(/(&|\?)_cacheOverride=\d+/, '');
+					      elem.href = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_cacheOverride=' + (new Date().valueOf());
+      				}
+		      		head.appendChild(elem);
+			    }
+		    }
+		  var protocol = window.location.protocol === 'http:' ? 'ws://' : 'wss://';
+		  var address = protocol + window.location.host + window.location.pathname + 'ws';
+		  var socket = new WebSocket(address);
+		  socket.onmessage = function(msg) {
+			  if (msg.data == 'reload') window.location.reload();
+			  else if (msg.data == 'refreshcss') refreshCSS();
+		  };
+		  console.log('Live reload enabled.');
+	  })();
+  }
+  </script>"""
 
 }
