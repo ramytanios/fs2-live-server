@@ -237,7 +237,7 @@ object LiveServer extends EpollApp {
       _ <- fs2.Stream
         .emits(cli.watch.getOrElse(cwd :: Nil))
         .covary[F]
-        .flatMap(Files[F].walk(_, 1, false))
+        .flatMap(Files[F].walk(_))
         .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
         .compile
         .drain

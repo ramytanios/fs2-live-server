@@ -1,28 +1,26 @@
 # fs2-live-server
 
-Scala rewrite of [Live Server](https://github.com/tapio/live-server) 
+Purely functional static server with hot-reload based on the following beautiful libraries 🔥:
+- [fs2](https://fs2.io/)👈🏼
+- [http4s](https://http4s.org/)👈🏼
+and built with [Scala CLI](https://scala-cli.virtuslab.org/)😎
 
-Build the app:
-```bash
-scala-cli --power package project.scala LiveServer.scala -f -o ls
-```
-Run the server:
-```bash
-./ls --entry-file=mock-index.html --proxy api:http://localhost:8090 --verbose
-```
+Inspired by NodeJS [Live Server](https://github.com/tapio/live-server)💡
 
-Equivalent `live-server` command:
-```bash
-live-server --entry-file=mock-index.html --proxy=/api:http://localhost:8090/api --verbose
+For development using [nix](https://nixos.org/download.html)🔧
+```
+nix develop
 ```
 
-Build and run the mock server:
+Compile using [Scala Native](https://scala-native.org/en/latest/)⚙️
 ```bash
-scala-cli --power package project.scala MockServer.scala -f -o ms
-./ms
+./package-native
 ```
 
-TODO: 
-1. open browser automatically on server startup
-2. Better logging 
-3. respect .gitignore
+Run the server, for example 🚀🚀
+```bash
+./live-server --entry-file=index.html --proxy=api:http://localhost:8090
+```
+
+TODO ‼️
+1. Open browser automatically on server startup
