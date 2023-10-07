@@ -34,7 +34,12 @@ import scala.concurrent.duration.*
 import scala.io.AnsiColor
 import fs2.io.process.Processes
 
-object LiveServer extends CommandIOApp(name="live server", header = "Foo") {
+object LiveServer
+    extends CommandIOApp(
+      name = "live server",
+      header = "Foo",
+      version = "0.0.1"
+    ) {
 
   case class Cli(
       host: Host,
@@ -82,14 +87,9 @@ object LiveServer extends CommandIOApp(name="live server", header = "Foo") {
       }
   }
 
-  final class StaticFileServer[F[_]: Files](
-      indexHtml: String,
-      cwd: Fs2Path
-  )(using F: Async[F], C: Console[F])
-      extends Http4sDsl[F] {
-
-    private def readFileF(path: Fs2Path): F[String] =
-      Files[F].readUtf8(path).compile.onlyOrError
+  final class StaticFileServer[F[_]: Files](indexHtml: String, cwd: Fs2Path)(
+      using F: Async[F]
+  ) extends Http4sDsl[F] {
 
     val routes: HttpRoutes[F] = HttpRoutes.of[F] {
       case GET -> Root =>
