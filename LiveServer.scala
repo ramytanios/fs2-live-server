@@ -56,7 +56,9 @@ object LiveServer extends EpollApp {
       watch: Option[List[Fs2Path]],
       proxy: Option[(UriPath.Segment, Uri)],
       cors: Boolean,
-      verbose: Boolean
+      verbose: Boolean,
+      browser: Option[String],
+      maxDepthWatch: Int
   ) {
     def withPort(port: Port) = this.copy(port = port)
 
@@ -238,7 +240,7 @@ object LiveServer extends EpollApp {
       _ <- fs2.Stream
         .emits(cli.watch.getOrElse(cwd :: Nil))
         .covary[F]
-        .flatMap(Files[F].walk(_))
+        .flatMap(Files[F].walk(_, cli.maxDepthWatch, false))
         .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
         .compile
         .drain
@@ -317,32 +319,35 @@ object LiveServer extends EpollApp {
           }
         }
 
-      _ <- fs2.io.process
-        .ProcessBuilder("firefox", s"http://${cli.host}:${cli.port}" :: Nil)
-        .spawn
-        .use(_.exitValue.flatMap { C.println(_) })
-        .background
-
     } yield killSwitch.get).useEval
 
   def runServer[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    runServerImpl(cli).recoverWith { case ex: java.net.BindException =>
-      for {
-        _ <- C.errorln(ex.toString)
-        _ <- C.println(
-          s"""${AnsiColor.RED}Failed to start server.
+    runServerImpl(cli)
+      .flatMap { _ =>
+        cli.browser.foldMapM(
+          fs2.io.process
+            .ProcessBuilder(_, s"http://${cli.host}:${cli.port}")
+            .spawn
+            .use_
+        )
+      }
+      .recoverWith { case ex: java.net.BindException =>
+        for {
+          _ <- C.errorln(ex.toString)
+          _ <- C.println(
+            s"""${AnsiColor.RED}Failed to start server.
           Perhaps port ${cli.port} is already in use.
           Attempt to find other port ..${AnsiColor.RESET}"""
-        )
-        rg <- Random.scalaUtilRandom[F]
-        newPort <- rg
-          .betweenInt(1024, 65535)
-          .map(Port.fromInt(_).get) // `get` is safe here
-        _ <- runServer(cli.withPort(newPort))
-      } yield ()
-    }
+          )
+          rg <- Random.scalaUtilRandom[F]
+          newPort <- rg
+            .betweenInt(1024, 65535)
+            .map(Port.fromInt(_).get) // `get` is safe here
+          _ <- runServer(cli.withPort(newPort))
+        } yield ()
+      }
 
   def mainOpts: Opts[IO[ExitCode]] = {
 
@@ -399,8 +404,29 @@ object LiveServer extends EpollApp {
     val verbose =
       Opts.flag("verbose", "Logs all requests and responses", "V").orFalse
 
+    val browser = Opts
+      .option[String]("browser", "Path to browser to open automatically")
+      .orNone
+
+    val maxDepthWatch = Opts
+      .option[Int]("max-depth-watch", "Maximum depth to watch changes")
+      .withDefault(Int.MaxValue)
+
     val cli =
-      (host, port, wait0, cwd, entryFile, ignore, watch, proxy, cors, verbose)
+      (
+        host,
+        port,
+        wait0,
+        cwd,
+        entryFile,
+        ignore,
+        watch,
+        proxy,
+        cors,
+        verbose,
+        browser,
+        maxDepthWatch
+      )
         .mapN(Cli.apply)
 
     cli.map(runServer[IO](_).as(ExitCode.Success))
