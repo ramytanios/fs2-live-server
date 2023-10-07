@@ -69,7 +69,7 @@
           outputHashAlgo = "sha256";
           outputHashMode = "recursive";
           # NOTE: don't forget to update this when deps change!
-          outputHash = "sha256-hagKQcBvFdrTwSOgrDp78lkgj73iybe9dmynGmjynKI=";
+          outputHash = "sha256-fidGzudPWjuW5sXgeCuLU29DlOqOLAVxxAblyCPn+jU=" ;
         };
 
         scala-native-app = pkgs.stdenv.mkDerivation {
@@ -203,7 +203,7 @@
         };
 
         devShell = pkgs.devshell.mkShell {
-          name = "scala-native-http4s-dev-shell";
+          name = "fs2-live-server-dev-shell";
           commands =
             [ { package = scala-cli; } { package = sbt; } { package = node; } ];
           packages = build-packages ++ [ sbt metals ];
