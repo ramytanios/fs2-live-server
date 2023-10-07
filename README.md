@@ -1,8 +1,8 @@
 # fs2-live-server
 
 Purely functional static server with hot-reload based on the following beautiful libraries 🔥:
-- [fs2](https://fs2.io/)👈🏼
-- [http4s](https://http4s.org/)👈🏼
+- [fs2](https://fs2.io/) 👈🏼
+- [http4s](https://http4s.org/) 👈
 
 and built with [Scala CLI](https://scala-cli.virtuslab.org/) 😎
 
