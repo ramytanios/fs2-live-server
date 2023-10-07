@@ -35,6 +35,7 @@ import org.typelevel.ci.CIString
 import java.net.BindException
 import scala.concurrent.duration.*
 import scala.io.AnsiColor
+import fs2.io.process.Processes
 
 object LiveServer extends EpollApp {
 
@@ -219,7 +220,7 @@ object LiveServer extends EpollApp {
       .compile
       .drain
 
-  def runServerImpl[F[_]: Files: Network](
+  def runServerImpl[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
     (for {
@@ -316,9 +317,15 @@ object LiveServer extends EpollApp {
           }
         }
 
+      _ <- fs2.io.process
+        .ProcessBuilder("firefox", s"http://${cli.host}:${cli.port}" :: Nil)
+        .spawn
+        .use(_.exitValue.flatMap { C.println(_) })
+        .background
+
     } yield killSwitch.get).useEval
 
-  def runServer[F[_]: Files: Network](
+  def runServer[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
     runServerImpl(cli).recoverWith { case ex: java.net.BindException =>
