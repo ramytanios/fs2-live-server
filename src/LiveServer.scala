@@ -11,10 +11,8 @@ import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
 import com.monovore.decline.effect.*
-import epollcat.EpollApp
 import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
-import fs2.io.file.Watcher.Event
 import fs2.io.file.{Path => Fs2Path}
 import fs2.io.net.Network
 import mouse.all.*
@@ -26,7 +24,6 @@ import org.http4s.dsl.io.*
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.headers.`Content-Type`
-import org.http4s.server.Server
 import org.http4s.server.middleware
 import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
@@ -37,14 +34,7 @@ import scala.concurrent.duration.*
 import scala.io.AnsiColor
 import fs2.io.process.Processes
 
-object LiveServer extends EpollApp {
-
-  override final def run(args: List[String]): IO[ExitCode] =
-    CommandIOApp
-      .run[IO]("live server", "Purely functional live server", true, None)(
-        mainOpts,
-        args
-      )
+object LiveServer extends CommandIOApp(name="live server", header = "Foo") {
 
   case class Cli(
       host: Host,
@@ -349,7 +339,7 @@ object LiveServer extends EpollApp {
         } yield ()
       }
 
-  def mainOpts: Opts[IO[ExitCode]] = {
+  override def main: Opts[IO[ExitCode]] = {
 
     val host = Opts
       .option[String]("host", "Host")
