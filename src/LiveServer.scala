@@ -37,7 +37,7 @@ import fs2.io.process.Processes
 object LiveServer
     extends CommandIOApp(
       name = "live server",
-      header = "Foo",
+      header = "Purely functional live server with hot reload functionality",
       version = "0.0.1"
     ) {
 
@@ -297,15 +297,20 @@ object LiveServer
         .build
         .evalTap { _ =>
           {
-            val segment = cli.proxy.map(_._1.toString).getOrElse("")
-            val uri = cli.proxy.map(_._2.toString).getOrElse("")
+            val segment = cli.proxy.map(_._1.toString)
+            val uri = cli.proxy.map(_._2.toString)
             C.println(
               s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
-                  |http://${cli.host}:${cli.port}
-                  |Remapping /$segment to $uri/$segment ${AnsiColor.RESET}""".stripMargin
-            ) *> C.println(
-              s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
-            )
+                  |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
+            ) *>
+              (segment, uri).tupled.foldMapM { case (seg, uri) =>
+                C.println(
+                  s"${AnsiColor.MAGENTA}Remapping /$segment to $uri/$seg ${AnsiColor.RESET}"
+                )
+              }
+              *> C.println(
+                s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
+              )
           }
         }
 
