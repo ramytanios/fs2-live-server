@@ -40,7 +40,7 @@
         # we must hash the coursier caches created during the build
         coursier-cache = pkgs.stdenv.mkDerivation {
           name = "coursier-cache";
-          src = ./;
+          src = ./src;
 
           buildInputs = build-packages;
 
@@ -74,7 +74,7 @@
 
         scala-native-app = pkgs.stdenv.mkDerivation {
           name = "scala-native-app";
-          src = ./;
+          src = ./src;
           buildInputs = build-packages ++ [ coursier-cache ];
 
           JAVA_HOME = "${jdk}";
@@ -103,7 +103,7 @@
 
         jvm-app = pkgs.stdenv.mkDerivation {
           name = "jvm-app";
-          src = ./;
+          src = ./src;
           buildInputs = build-packages ++ [ coursier-cache ];
 
           JAVA_HOME = "${jdk}";
@@ -130,7 +130,7 @@
 
         node-app = pkgs.stdenv.mkDerivation {
           name = "scala-js-app";
-          src = ./;
+          src = ./src;
           buildInputs = build-packages ++ [ node coursier-cache ];
 
           JAVA_HOME = "${jdk}";
@@ -167,7 +167,7 @@
 
         graal-native-image-app = pkgs.stdenv.mkDerivation {
           name = "graal-native-image-app";
-          src = ./;
+          src = ./src;
           buildInputs = build-packages ++ [ coursier-cache ];
 
           JAVA_HOME = "${jdk}";
