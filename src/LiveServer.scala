@@ -314,27 +314,26 @@ object LiveServer
           }
         }
 
+      _ <- cli.browser.fold(Resource.pure(()))(browser =>
+        fs2.io.process
+          .ProcessBuilder(browser, s"http://${cli.host}:${cli.port}")
+          .spawn
+      )
+
     } yield killSwitch.get).useEval
 
   def runServer[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
     runServerImpl(cli)
-      .flatMap { _ =>
-        cli.browser.foldMapM(
-          fs2.io.process
-            .ProcessBuilder(_, s"http://${cli.host}:${cli.port}")
-            .spawn
-            .use_
-        )
-      }
       .recoverWith { case ex: java.net.BindException =>
         for {
           _ <- C.errorln(ex.toString)
           _ <- C.println(
-            s"""${AnsiColor.RED}Failed to start server.
-          Perhaps port ${cli.port} is already in use.
-          Attempt to find other port ..${AnsiColor.RESET}"""
+            s"""
+            |${AnsiColor.RED}Failed to start server.
+            |Perhaps port ${cli.port} is already in use.
+            |Attempt to find other port ..${AnsiColor.RESET}""".stripMargin
           )
           rg <- Random.scalaUtilRandom[F]
           newPort <- rg
