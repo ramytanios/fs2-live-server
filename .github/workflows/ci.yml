@@ -1,0 +1,46 @@
+name: Deployment
+
+on:  
+  push:
+    tags:
+    - '*'
+
+jobs:
+  dist:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            release_suffix: linux
+            upload: true
+          - os: macos-latest
+            release_suffix: macos
+            upload: false
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Git checkout 
+      uses: actions/checkout@v3
+
+    - name: Install scala-cli
+      uses: VirtusLab/scala-cli-setup@v1.0.5
+      with: 
+        power: true
+
+    - name: Compile
+      run: scala-cli compile ./src
+
+    - name: Package
+      run: scala-cli package ./src --standalone -o fs2-live-server
+
+    - name: Zip
+      run: zip -rj fs2-liver-server-${{ matrix.release_suffix }}.zip fs2-live-server
+
+    - name: Release
+      if: matrix.upload
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: fs2-liver-server-${{ matrix.release_suffix }}.zip
+        generateReleaseNotes: true
+        token: ${{ secrets.GITHUB_TOKEN }}
