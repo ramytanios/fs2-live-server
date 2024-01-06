@@ -1,5 +1,5 @@
 //> using scala 3.3.1
-//> using options -deprecation -feature -explain -Wunused:all
+//> using options -deprecation -feature -explain -Wunused:all -indent -rewrite
 //> using toolkit typelevel::latest
 //> using dep co.fs2::fs2-core::3.10-4b5f50b
 //> using dep co.fs2::fs2-io::3.10-4b5f50b

@@ -39,7 +39,7 @@ object LiveServer
       name = "live server",
       header = "Purely functional live server with hot reload functionality",
       version = "0.0.1"
-    ) {
+    ):
 
   case class Cli(
       host: Host,
@@ -54,7 +54,7 @@ object LiveServer
       verbose: Boolean,
       browser: Option[String],
       maxDepthWatch: Int
-  ) {
+  ):
     def withPort(port: Port) = this.copy(port = port)
 
     def ignorePath(p: Fs2Path): Boolean =
@@ -62,11 +62,10 @@ object LiveServer
         .fold(false :: Nil)(_.toList.map(_.r.findFirstIn(p.toString).isDefined))
         .reduce(_ || _)
 
-  }
 
   final class Websocket[F[_]](wsb: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
-  ) extends Http4sDsl[F] {
+  ) extends Http4sDsl[F]:
     val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root / "ws" =>
       val send: fs2.Stream[F, WebSocketFrame] =
         fs2.Stream
@@ -77,21 +76,18 @@ object LiveServer
 
       wsb.build(send, receive)
     }
-  }
 
-  object ScriptInjector {
+  object ScriptInjector:
     def apply(html: String, script: String): Option[String] =
-      html.indexOf("</html>") match {
+      html.indexOf("</html>") match
         case -1 => None
         case ix => html.patch(ix, script, 0).some
-      }
-  }
 
   final class StaticFileServer[F[_]: Files](indexHtml: String, cwd: Fs2Path)(
       using F: Async[F]
-  ) extends Http4sDsl[F] {
+  ) extends Http4sDsl[F]:
 
-    val routes: HttpRoutes[F] = HttpRoutes.of[F] {
+    val routes: HttpRoutes[F] = HttpRoutes.of[F]:
       case GET -> Root =>
         Response[F]()
           .withEntity(indexHtml)
@@ -102,10 +98,8 @@ object LiveServer
         StaticFile
           .fromPath[F](cwd / Fs2Path(s".${path.toString}"))
           .getOrElseF(NotFound())
-    }
-  }
 
-  object ErrorLoggingMiddleware {
+  object ErrorLoggingMiddleware:
 
     def apply[F[_]: MonadThrow: Console](routes: HttpRoutes[F]): HttpRoutes[F] =
       org.http4s.server.middleware.ErrorAction.httpRoutes
@@ -115,9 +109,8 @@ object LiveServer
           (t, msg) => Console[F].errorln(s"$msg: $t")
         )
 
-  }
 
-  object ProxyMiddleware {
+  object ProxyMiddleware:
 
     def apply[F[_]](
         path: UriPath.Segment,
@@ -125,19 +118,17 @@ object LiveServer
         client: Client[F]
     )(httpRoutes: HttpRoutes[F])(using F: Concurrent[F]): HttpRoutes[F] =
       Kleisli { req =>
-        req.uri match {
+        req.uri match
           case Uri(_, _, path0, _, _)
               if path0.segments.headOption.exists(_ == path) =>
             OptionT(
               client.stream(req.withUri(uri.withPath(path0))).compile.last
             )
           case _ => httpRoutes(req)
-        }
       }
 
-  }
 
-  object RequestsSimpleLoggingMiddleware {
+  object RequestsSimpleLoggingMiddleware:
 
     def apply[F[_]: Async](httpRoutes: HttpRoutes[F])(using
         C: Console[F]
@@ -157,15 +148,13 @@ object LiveServer
         ).some
       )(httpRoutes)
 
-  }
 
-  trait PathWatcher[F[_]] {
+  trait PathWatcher[F[_]]:
 
     /** stream of notifications */
     def changes: fs2.Stream[F, Unit]
-  }
 
-  object PathWatcher {
+  object PathWatcher:
     def apply[F[_]: Temporal: Files: Console](
         p: Fs2Path,
         watchEvery: FiniteDuration
@@ -192,12 +181,10 @@ object LiveServer
           .drain
           .background
 
-      } yield new PathWatcher[F] {
+      } yield new PathWatcher[F]:
 
         override def changes: fs2.Stream[F, Unit] =
           lmt.changes.discrete.as(()).tail
-      }
-  }
 
   def watchPathImpl[F[_]: Concurrent: Temporal: Files: Console](
       p: Fs2Path,
@@ -343,7 +330,7 @@ object LiveServer
         } yield ()
       }
 
-  override def main: Opts[IO[ExitCode]] = {
+  override def main: Opts[IO[ExitCode]] =
 
     val host = Opts
       .option[String]("host", "Host")
@@ -425,7 +412,6 @@ object LiveServer
 
     cli.map(runServer[IO](_).as(ExitCode.Success))
 
-  }
 
   private lazy val scriptTagToInject = """
   <script type="text/javascript">
@@ -459,4 +445,3 @@ object LiveServer
   }
   </script>"""
 
-}
