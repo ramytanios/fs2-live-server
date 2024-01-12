@@ -30,17 +30,17 @@ import java.net.BindException
 import scala.concurrent.duration.*
 import scala.io.AnsiColor
 
-extension (text: String)
-  def colorRed: String = s"${AnsiColor.RED}$text${AnsiColor.RESET}"
-  def colorMagenta: String = s"${AnsiColor.MAGENTA}$text${AnsiColor.RESET}"
-  def colorCyan: String = s"${AnsiColor.CYAN}$text${AnsiColor.RESET}"
-
 object LiveServer
     extends CommandIOApp(
       name = "live server",
       header = "Purely functional live server with hot reload functionality",
       version = "0.0.1"
     ):
+
+  extension (text: String)
+    def colorRed: String = s"${AnsiColor.RED}$text${AnsiColor.RESET}"
+    def colorMagenta: String = s"${AnsiColor.MAGENTA}$text${AnsiColor.RESET}"
+    def colorCyan: String = s"${AnsiColor.CYAN}$text${AnsiColor.RESET}"
 
   case class Cli(
       host: Host,
@@ -238,7 +238,8 @@ object LiveServer
         .compile
         .onlyOrError
         .flatMap: indexHtml =>
-          ScriptInjector(indexHtml, scriptTagToInject).liftTo[Option](
+          F.fromOption(
+            ScriptInjector(indexHtml, scriptTagToInject),
             new RuntimeException("Failed to inject script tag")
           )
         .toResource
