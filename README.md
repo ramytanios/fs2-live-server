@@ -15,20 +15,11 @@ If you have [nix](https://nixos.org/download.html) installed and [flakes enabled
 ```shell
 # JVM app
 nix run github:ramytanios/fs2-live-server#jvm --refresh
-
-# Scala native executable
-nix run github:ramytanios/fs2-live-server#native --refresh
-
-# GraalVM native image
-nix run github:ramytanios/fs2-live-server#graal --refresh
-
-# Node.js app
-nix run github:ramytanios/fs2-live-server#node --refresh
 ```
 
 If you want the actual binary, simply replace `run` by `build`.⚙️
 
 This flake also contains a dev shell suitable for working on the app:
 ```shell
-nix develop github:ramytanios/fs2-live-server --refresh
+nix develop
 ```
