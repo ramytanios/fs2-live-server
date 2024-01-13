@@ -8,8 +8,6 @@ and built with [Scala CLI](https://scala-cli.virtuslab.org/) 😎
 
 Inspired by NodeJS [Live Server](https://github.com/tapio/live-server) 💡
 
-Flake setup based on the template [Flake template](https://github.com/buntec/flake-templates) ⚡⚡
-
 If you have [nix](https://nixos.org/download.html) installed and [flakes enabled](https://nixos.wiki/wiki/Flakes#Enable_flakes):
 
 ```shell
