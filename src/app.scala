@@ -1,12 +1,8 @@
 import cats.MonadThrow
-import cats.data.Kleisli
-import cats.data.NonEmptyList
-import cats.data.OptionT
+import cats.data.*
 import cats.effect.*
 import cats.effect.implicits.*
-import cats.effect.std.Console
-import cats.effect.std.Queue
-import cats.effect.std.Random
+import cats.effect.std.*
 import cats.syntax.all.*
 import com.comcast.ip4s.*
 import com.monovore.decline.*
@@ -15,6 +11,7 @@ import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
 import fs2.io.file.{Path => Fs2Path}
 import fs2.io.net.Network
+import fs2.io.process.Processes
 import mouse.all.*
 import org.http4s.Uri.{Path => UriPath}
 import org.http4s.*
@@ -32,14 +29,18 @@ import org.typelevel.ci.CIString
 import java.net.BindException
 import scala.concurrent.duration.*
 import scala.io.AnsiColor
-import fs2.io.process.Processes
 
 object LiveServer
     extends CommandIOApp(
       name = "live server",
       header = "Purely functional live server with hot reload functionality",
       version = "0.0.1"
-    ) {
+    ):
+
+  extension (text: String)
+    def colorRed: String = s"${AnsiColor.RED}$text${AnsiColor.RESET}"
+    def colorMagenta: String = s"${AnsiColor.MAGENTA}$text${AnsiColor.RESET}"
+    def colorCyan: String = s"${AnsiColor.CYAN}$text${AnsiColor.RESET}"
 
   case class Cli(
       host: Host,
@@ -54,7 +55,7 @@ object LiveServer
       verbose: Boolean,
       browser: Option[String],
       maxDepthWatch: Int
-  ) {
+  ):
     def withPort(port: Port) = this.copy(port = port)
 
     def ignorePath(p: Fs2Path): Boolean =
@@ -62,11 +63,9 @@ object LiveServer
         .fold(false :: Nil)(_.toList.map(_.r.findFirstIn(p.toString).isDefined))
         .reduce(_ || _)
 
-  }
-
   final class Websocket[F[_]](wsb: WebSocketBuilder2[F], sq: Queue[F, String])(
       using F: Async[F]
-  ) extends Http4sDsl[F] {
+  ) extends Http4sDsl[F]:
     val routes: HttpRoutes[F] = HttpRoutes.of[F] { case GET -> Root / "ws" =>
       val send: fs2.Stream[F, WebSocketFrame] =
         fs2.Stream
@@ -77,21 +76,18 @@ object LiveServer
 
       wsb.build(send, receive)
     }
-  }
 
-  object ScriptInjector {
+  object ScriptInjector:
     def apply(html: String, script: String): Option[String] =
-      html.indexOf("</html>") match {
+      html.indexOf("</html>") match
         case -1 => None
         case ix => html.patch(ix, script, 0).some
-      }
-  }
 
   final class StaticFileServer[F[_]: Files](indexHtml: String, cwd: Fs2Path)(
       using F: Async[F]
-  ) extends Http4sDsl[F] {
+  ) extends Http4sDsl[F]:
 
-    val routes: HttpRoutes[F] = HttpRoutes.of[F] {
+    val routes: HttpRoutes[F] = HttpRoutes.of[F]:
       case GET -> Root =>
         Response[F]()
           .withEntity(indexHtml)
@@ -102,10 +98,8 @@ object LiveServer
         StaticFile
           .fromPath[F](cwd / Fs2Path(s".${path.toString}"))
           .getOrElseF(NotFound())
-    }
-  }
 
-  object ErrorLoggingMiddleware {
+  object ErrorLoggingMiddleware:
 
     def apply[F[_]: MonadThrow: Console](routes: HttpRoutes[F]): HttpRoutes[F] =
       org.http4s.server.middleware.ErrorAction.httpRoutes
@@ -115,9 +109,7 @@ object LiveServer
           (t, msg) => Console[F].errorln(s"$msg: $t")
         )
 
-  }
-
-  object ProxyMiddleware {
+  object ProxyMiddleware:
 
     def apply[F[_]](
         path: UriPath.Segment,
@@ -125,19 +117,16 @@ object LiveServer
         client: Client[F]
     )(httpRoutes: HttpRoutes[F])(using F: Concurrent[F]): HttpRoutes[F] =
       Kleisli { req =>
-        req.uri match {
+        req.uri match
           case Uri(_, _, path0, _, _)
               if path0.segments.headOption.exists(_ == path) =>
             OptionT(
               client.stream(req.withUri(uri.withPath(path0))).compile.last
             )
           case _ => httpRoutes(req)
-        }
       }
 
-  }
-
-  object RequestsSimpleLoggingMiddleware {
+  object RequestsSimpleLoggingMiddleware:
 
     def apply[F[_]: Async](httpRoutes: HttpRoutes[F])(using
         C: Console[F]
@@ -157,20 +146,17 @@ object LiveServer
         ).some
       )(httpRoutes)
 
-  }
-
-  trait PathWatcher[F[_]] {
+  trait PathWatcher[F[_]]:
 
     /** stream of notifications */
     def changes: fs2.Stream[F, Unit]
-  }
 
-  object PathWatcher {
+  object PathWatcher:
     def apply[F[_]: Temporal: Files: Console](
         p: Fs2Path,
         watchEvery: FiniteDuration
     )(implicit C: Console[F]): Resource[F, PathWatcher[F]] =
-      for {
+      for
         currentLmt <- Files[F].getLastModifiedTime(p).toResource
 
         lmt <- SignallingRef
@@ -191,13 +177,10 @@ object LiveServer
           .compile
           .drain
           .background
-
-      } yield new PathWatcher[F] {
+      yield new PathWatcher[F]:
 
         override def changes: fs2.Stream[F, Unit] =
           lmt.changes.discrete.as(()).tail
-      }
-  }
 
   def watchPathImpl[F[_]: Concurrent: Temporal: Files: Console](
       p: Fs2Path,
@@ -215,7 +198,7 @@ object LiveServer
   def runServerImpl[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
-    (for {
+    (for
       killSwitch <- F.deferred[Unit].toResource
       flipKillSwitch = killSwitch.complete(()).void
 
@@ -234,18 +217,18 @@ object LiveServer
         .parEvalMapUnorderedUnbounded(watchPathImpl(_, 1.second, eventQ))
         .compile
         .drain
-        .onError(t => C.errorln("file watcher failed: $t") *> flipKillSwitch)
+        .onError: t =>
+          C.errorln("file watcher failed: $t") *> flipKillSwitch
         .background
 
       _ <- fs2.Stream
         .fromQueueUnterminated(eventQ)
         .filterNot(cli.ignorePath)
         .debounce(cli.wait0)
-        .evalMap(p =>
+        .evalMap: p =>
           wsOut.offer("reload") *> C.println(
-            s"""${AnsiColor.CYAN}Changes detected in `$p`${AnsiColor.RESET}"""
+            s"Changes detected in `$p`".colorCyan
           )
-        )
         .compile
         .drain
         .background
@@ -254,26 +237,23 @@ object LiveServer
         .readUtf8(cwd / cli.entryFile)
         .compile
         .onlyOrError
-        .flatMap { indexHtml =>
+        .flatMap: indexHtml =>
           F.fromOption(
             ScriptInjector(indexHtml, scriptTagToInject),
             new RuntimeException("Failed to inject script tag")
           )
-        }
         .toResource
 
       app <- Resource
         .pure(
           new StaticFileServer[F](indexHtmlWithInjectedScriptTag, cwd).routes
         )
-        .flatMap(app0 =>
-          cli.proxy.fold(Resource.pure(app0)) { case (path, url) =>
+        .flatMap: app0 =>
+          cli.proxy.fold(Resource.pure(app0)): (path, url) =>
             EmberClientBuilder
               .default[F]
               .build
               .map(client => ProxyMiddleware(path, url, client)(app0))
-          }
-        )
         .map(ErrorLoggingMiddleware[F])
         .map(RequestsSimpleLoggingMiddleware[F])
         .map(cli.cors.applyIf(_)(middleware.CORS.policy.withAllowOriginAll(_)))
@@ -295,55 +275,47 @@ object LiveServer
           (new Websocket[F](wsb, wsOut).routes <+> app).orNotFound
         )
         .build
-        .evalTap { _ =>
-          {
-            val segment = cli.proxy.map(_._1.toString)
-            val uri = cli.proxy.map(_._2.toString)
-            C.println(
-              s"""|${AnsiColor.MAGENTA}Live server of $cwd started at: 
-                  |http://${cli.host}:${cli.port}${AnsiColor.RESET}""".stripMargin
-            ) *>
-              (segment, uri).tupled.foldMapM { case (seg, uri) =>
-                C.println(
-                  s"${AnsiColor.MAGENTA}Remapping /$segment to $uri/$seg ${AnsiColor.RESET}"
-                )
-              }
-              *> C.println(
-                s"""${AnsiColor.RED}Ready to watch changes${AnsiColor.RESET}"""
-              )
-          }
-        }
+        .evalTap: _ =>
+          for
+            segment <- F.pure(cli.proxy.map(_._1.toString))
+            uri <- F.pure(cli.proxy.map(_._2.toString))
+            _ <- C.println(
+              s"""|Live server of $cwd started at: 
+                  |http://${cli.host}:${cli.port}""".stripMargin.colorMagenta
+            )
+            _ <- (segment, uri).tupled.foldMapM: (seg, uri) =>
+              C.println(s"Remapping /$segment to $uri/$seg".colorMagenta)
+            _ <- C.println(s"Ready to watch changes".colorRed)
+          yield ()
 
-      _ <- cli.browser.fold(Resource.pure(()))(browser =>
+      _ <- cli.browser.fold(Resource.pure(())): browser =>
         fs2.io.process
           .ProcessBuilder(browser, s"http://${cli.host}:${cli.port}")
           .spawn
-      )
-
-    } yield killSwitch.get).useEval
+    yield killSwitch.get).useEval
 
   def runServer[F[_]: Files: Network: Processes](
       cli: Cli
   )(using F: Async[F], C: Console[F]): F[Unit] =
     runServerImpl(cli)
-      .recoverWith { case ex: java.net.BindException =>
-        for {
-          _ <- C.errorln(ex.toString)
-          _ <- C.println(
-            s"""
-            |${AnsiColor.RED}Failed to start server.
+      .recoverWith:
+        case ex: java.net.BindException =>
+          for
+            _ <- C.errorln(ex.toString)
+            _ <- C.println(
+              s"""
+            |Failed to start server.
             |Perhaps port ${cli.port} is already in use.
-            |Attempt to find other port ..${AnsiColor.RESET}""".stripMargin
-          )
-          rg <- Random.scalaUtilRandom[F]
-          newPort <- rg
-            .betweenInt(1024, 65535)
-            .map(Port.fromInt(_).get) // `get` is safe here
-          _ <- runServer(cli.withPort(newPort))
-        } yield ()
-      }
+            |Attempt to find other port ..""".stripMargin.colorRed
+            )
+            rg <- Random.scalaUtilRandom[F]
+            newPort <- rg
+              .betweenInt(1024, 65535)
+              .map(Port.fromInt(_).get) // `get` is safe here
+            _ <- runServer(cli.withPort(newPort))
+          yield ()
 
-  override def main: Opts[IO[ExitCode]] = {
+  override def main: Opts[IO[ExitCode]] =
 
     val host = Opts
       .option[String]("host", "Host")
@@ -425,8 +397,6 @@ object LiveServer
 
     cli.map(runServer[IO](_).as(ExitCode.Success))
 
-  }
-
   private lazy val scriptTagToInject = """
   <script type="text/javascript">
   // Code injected by fs2-live-server
@@ -458,5 +428,3 @@ object LiveServer
 	  })();
   }
   </script>"""
-
-}
