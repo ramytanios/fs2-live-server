@@ -28,13 +28,14 @@ import org.typelevel.ci.CIString
 
 import java.net.BindException
 import scala.concurrent.duration.*
+import scala.cli.build.BuildInfo
 import scala.io.AnsiColor
 
 object LiveServer
     extends CommandIOApp(
       name = "live server",
       header = "Purely functional live server with hot reload functionality",
-      version = "0.0.1"
+      version = BuildInfo.projectVersion.getOrElse("NA")
     ):
 
   extension (text: String)
