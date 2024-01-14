@@ -341,9 +341,8 @@ object LiveServer
     val entryFile = Opts
       .option[String](
         "entry-file",
-        "Index html to be served as entry file - defaults to `index.html`"
+        "Index html to be served as entry file"
       )
-      .withDefault("index.html")
       .map(Fs2Path(_))
 
     val ignore = Opts
