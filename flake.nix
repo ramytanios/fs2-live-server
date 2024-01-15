@@ -12,7 +12,7 @@
       inherit (flake-utils.lib) mkApp;
 
       pname = "live-server";
-      version = if (self ? rev) then self.rev else "dirty";
+      version = if (self ? rev) then self.shortRev else self.dirtyShortRev;
 
       eachSystem = nixpkgs.lib.genAttrs flake-utils.lib.defaultSystems;
 
