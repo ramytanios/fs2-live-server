@@ -9,14 +9,11 @@ import com.monovore.decline.*
 import com.monovore.decline.effect.*
 import fs2.concurrent.SignallingRef
 import fs2.io.file.Files
-import fs2.io.file.{Path => Fs2Path}
+import fs2.io.file.Path as Fs2Path
 import fs2.io.net.Network
 import fs2.io.process.Processes
 import mouse.all.*
-import org.http4s.Uri.{Path => UriPath}
-import org.http4s.*
-import org.http4s.client.Client
-import org.http4s.dsl.*
+import org.http4s.Uri.Path as UriPath
 import org.http4s.dsl.io.*
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.ember.server.EmberServerBuilder
@@ -26,6 +23,9 @@ import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
 import org.typelevel.ci.CIString
 
+import org.http4s.*
+import org.http4s.client.Client
+import org.http4s.dsl.*
 import java.net.BindException
 import scala.concurrent.duration.*
 import scala.cli.build.BuildInfo
@@ -39,9 +39,9 @@ object LiveServer
     ):
 
   extension (text: String)
-    def colorRed: String = s"${AnsiColor.RED}$text${AnsiColor.RESET}"
+    def colorRed: String     = s"${AnsiColor.RED}$text${AnsiColor.RESET}"
     def colorMagenta: String = s"${AnsiColor.MAGENTA}$text${AnsiColor.RESET}"
-    def colorCyan: String = s"${AnsiColor.CYAN}$text${AnsiColor.RESET}"
+    def colorCyan: String    = s"${AnsiColor.CYAN}$text${AnsiColor.RESET}"
 
   case class Cli(
       host: Host,
@@ -137,13 +137,12 @@ object LiveServer
         logBody = false,
         logAction = (
             (msg: String) =>
-              msg.split(" ").toList match {
+              msg.split(" ").toList match
                 case List(http, method, path) =>
                   C.println(
                     s"${AnsiColor.YELLOW}$http${AnsiColor.BLUE} $method${AnsiColor.RESET} $path"
                   )
                 case other => C.println(other)
-              }
         ).some
       )(httpRoutes)
 
@@ -279,7 +278,7 @@ object LiveServer
         .evalTap: _ =>
           for
             segment <- F.pure(cli.proxy.map(_._1.toString))
-            uri <- F.pure(cli.proxy.map(_._2.toString))
+            uri     <- F.pure(cli.proxy.map(_._2.toString))
             _ <- C.println(
               s"""|Live server of $cwd started at: 
                   |http://${cli.host}:${cli.port}""".stripMargin.colorMagenta
@@ -356,13 +355,13 @@ object LiveServer
 
     val proxy = Opts
       .option[String]("proxy", "Path:URL proxy")
-      .mapValidated(proxy => {
+      .mapValidated(proxy =>
         val sp = proxy.split(":")
         (
           sp.headOption.map(UriPath.Segment),
           Uri.fromString(sp.tail.mkString(":")).toOption
         ).tupled.toValidNel("Bad proxy settings")
-      })
+      )
       .orNone
 
     val cors = Opts.flag("cors", "Allow any origin requests").orFalse
@@ -397,7 +396,8 @@ object LiveServer
 
     cli.map(runServer[IO](_).as(ExitCode.Success))
 
-  private lazy val scriptTagToInject = """
+  private lazy val scriptTagToInject =
+    """
   <script type="text/javascript">
   // Code injected by fs2-live-server
   // <![CDATA[  <-- For SVG support
