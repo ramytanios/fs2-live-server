@@ -1,71 +1,69 @@
 {
-  description = "Purely functional live server";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    typelevel-nix.url = "github:typelevel/typelevel-nix";
-    flake-utils.follows = "typelevel-nix/flake-utils";
-    scala-dev.url = "github:ramytanios/nix-lib";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    systems.url = "github:nix-systems/default";
+    devenv.url = "github:cachix/devenv";
+    devenv.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, typelevel-nix, flake-utils, scala-dev, ... }:
+  nixConfig = {
+    extra-trusted-public-keys = "devenv.cachix.org-1:w1cLUi8dv3hnoSPGAuibQv+f9TZLr6cv/Hm9XgU50cw=";
+    extra-substituters = "https://devenv.cachix.org";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      devenv,
+      systems,
+      ...
+    }@inputs:
     let
-      inherit (flake-utils.lib) mkApp;
+      forEachSystem = nixpkgs.lib.genAttrs (import systems);
+    in
+    {
+      packages = forEachSystem (system: {
+        devenv-up = self.devShells.${system}.default.config.procfileScript;
+        devenv-test = self.devShells.${system}.default.config.test;
+      });
 
-      pname = "live-server";
-      version = if (self ? rev) then self.shortRev else self.dirtyShortRev;
-
-      eachSystem = nixpkgs.lib.genAttrs flake-utils.lib.defaultSystems;
-
-      mkPackages = pkgs:
-        scala-dev.lib.mkBuildScalaApp pkgs {
-          inherit version;
-          inherit pname;
-          src = ./src;
-          supported-platforms = [ "jvm" ];
-          sha256 = "sha256-1+xnL/Bt78hQozjcXXzkUluchu2jUKBrfj3ZpvEQM8E=";
-        };
-
-      mkPckgs = system: import nixpkgs { inherit system; };
-
-    in {
-      # devshells
-      devShells = eachSystem (system:
+      devShells = forEachSystem (
+        system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ typelevel-nix.overlay ];
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = devenv.lib.mkShell {
+            inherit inputs pkgs;
+            modules = [
+              {
+                env.SCALA_CLI_POWER = true;
+
+                languages.nix.enable = true;
+                languages.scala.enable = true;
+
+                scripts = {
+                  git-clean.exec = ''
+                    git clean -Xdf
+                  '';
+
+                  update-deps.exec = ''
+                    scala-cli dependency-update .
+                  '';
+
+                  fix.exec = ''
+                    echo 'Running scalafmt'
+                    scala-cli fmt .
+
+                    echo 'Running scalafix'
+                    scala-cli fmt .
+                  '';
+                };
+              }
+            ];
           };
-        in {
-          default = pkgs.devshell.mkShell {
-            imports = [ typelevel-nix.typelevelShell ];
-            name = "${pname}-dev-shell";
-            typelevelShell = {
-              jdk.package = pkgs.jdk;
-              nodejs.enable = false;
-              native.enable = true;
-              native.libraries = with pkgs; [ zlib s2n-tls openssl ];
-            };
-            packages = with pkgs; [ which ];
-          };
-        });
-
-      # packages
-      packages = eachSystem (system: mkPackages (mkPckgs system));
-
-      # apps
-      apps = eachSystem (system:
-        builtins.mapAttrs (_: drv:
-          (mkApp {
-            inherit drv;
-            name = pname;
-          })) (mkPackages (mkPckgs system)));
-
-      #overlays
-      overlays = {
-        default = final: _: { ${pname} = (mkPackages final).jvm; };
-      };
-
-      # checks 
-      checks = self.packages;
+        }
+      );
     };
 }
