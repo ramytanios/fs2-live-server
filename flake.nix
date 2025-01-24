@@ -43,13 +43,28 @@
                 languages.nix.enable = true;
                 languages.scala.enable = true;
 
+                packages = with pkgs; [ jq ];
+
+                enterShell = ''
+                  scala-cli config power true
+                '';
+
                 scripts = {
+                  compile.exec = ''
+                    scala-cli compile . 
+                  '';
+
+                  run.exec = ''
+                    scala-cli run . 
+                  '';
+
                   git-clean.exec = ''
                     git clean -Xdf
                   '';
 
                   update-deps.exec = ''
-                    scala-cli dependency-update .
+                    scala-cli dependency-update . 
+                    scala-cli dependency-update . --all 
                   '';
 
                   fix.exec = ''
@@ -57,7 +72,11 @@
                     scala-cli fmt .
 
                     echo 'Running scalafix'
-                    scala-cli fmt .
+                    scala-cli fix . 
+                  '';
+
+                  show-config.exec = ''
+                    scala-cli config --dump | jq .
                   '';
                 };
               }
