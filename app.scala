@@ -13,7 +13,10 @@ import fs2.io.file.Path as Fs2Path
 import fs2.io.net.Network
 import fs2.io.process.Processes
 import mouse.all.*
+import org.http4s.*
 import org.http4s.Uri.Path as UriPath
+import org.http4s.client.Client
+import org.http4s.dsl.*
 import org.http4s.dsl.io.*
 import org.http4s.ember.client.EmberClientBuilder
 import org.http4s.ember.server.EmberServerBuilder
@@ -23,12 +26,9 @@ import org.http4s.server.websocket.WebSocketBuilder2
 import org.http4s.websocket.WebSocketFrame
 import org.typelevel.ci.CIString
 
-import org.http4s.*
-import org.http4s.client.Client
-import org.http4s.dsl.*
 import java.net.BindException
-import scala.concurrent.duration.*
 import scala.cli.build.BuildInfo
+import scala.concurrent.duration.*
 import scala.io.AnsiColor
 
 object LiveServer
