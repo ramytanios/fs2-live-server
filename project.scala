@@ -1,5 +1,5 @@
 // Main
-//> using scala 3.3.1
+//> using scala 3.6.3
 //> using options -Wunused:all -deprecation -explain -feature
 //> using toolkit typelevel::latest
 
