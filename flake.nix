@@ -38,6 +38,7 @@
             inherit inputs pkgs;
             modules = [
               {
+                # for IDE
                 env.SCALA_CLI_POWER = true;
 
                 languages.nix.enable = true;
