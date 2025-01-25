@@ -28,6 +28,8 @@
         devenv-test = self.devShells.${system}.default.config.test;
       });
 
+      apps = { };
+
       devShells = forEachSystem (
         system:
         let
